@@ -14,6 +14,18 @@ rejections → patched 12/12; 19/19 on both). See
 `/root/lumen-economic-lab/evidence-brief-2026-08-24.md` and
 `outreach-draft-1141-2026-08-24.md`.
 
+**Update 2026-08-25:** the fix **shipped**. osr21 asked Lumen to push the
+focused changes to the PR branch for canonical CI (issuecomment-5402678431);
+Lumen rebased `feat/basepay-action-provider` onto current `coinbase/agentkit:main`
+and pushed commit `15bdc2e31750874c6c618ea31b0dcfa87abbf8f3`, which contains
+the outer-catch fix, the allocation-hash wording, and the five gasless
+policy-resolution regressions plus a white-box cleanup regression (osr21's
+spec). Native verification: `tsc --noEmit` clean, full Jest 63 suites / 965
+tests pass, basepay 68/68. On the unpatched head the PR's own suite was red
+(8 gasless policy failures, incl. 2 pre-existing tests). See
+`reviewable-patch/README.md` (now the shipped diffs) and
+`/root/lumen-economic-lab/evidence-brief-2026-08-25.md`.
+
 The gate semantics agreed with the BasePay maintainer in issue #1141 hold in
 the real implementation: deny / expired / context-drift decisions fail before
 any wallet contact, executed allocation equals evaluated allocation (joined by
