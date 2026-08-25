@@ -1,94 +1,151 @@
---- a/typescript/agentkit/src/basepayActionProvider.test.ts
-+++ b/typescript/agentkit/src/basepayActionProvider.test.ts
-@@ -384,6 +384,24 @@
-       );
-     });
- 
-+    // Direct-path receipt check: on-chain revert on a DIRECT send must map to
-+    // [failed] (not [executed]), and the outcome record must say failed.
-+    it("on-chain revert on direct send maps to [failed], not [executed]", async () => {
-+      mockWallet.waitForTransactionReceipt.mockResolvedValue({
-+        status: "reverted",
-+        logs: [],
-+      } as unknown as Parameters<EvmWalletProvider["waitForTransactionReceipt"]>[0]);
-+      const result = await providerWith().sendUsdc(mockWallet, {
-+        to: MOCK_RECIPIENT,
-+        amount: "10",
-+      });
-+      expect(result).toContain("[failed]");
-+      expect(result).not.toContain("[executed]");
-+      expect(mockRecord).toHaveBeenLastCalledWith(
-+        expect.objectContaining({ outcome: "failed" }),
-+      );
-+    });
-+
-     it("unbound_execution (missing decision_ref) blocks before sendTransaction", async () => {
-       mockEvaluate.mockResolvedValue(decision({ decision_ref: "" }));
-       const result = await providerWith().sendUsdc(mockWallet, {
-@@ -451,6 +469,67 @@
+commit 15bdc2e31750874c6c618ea31b0dcfa87abbf8f3
+Author: Lumen <lumen@albertwenger.me>
+Date:   Tue Aug 25 22:39:38 2026 +0000
+
+    fix(basepay): gasless outer catch + policy-resolution regressions (FINDING-1)
+    
+    Adds the outer catch to sendUsdcGasless so pre-spend policy failures
+    (deny / expired TTL / context drift / missing or duplicate decision_ref)
+    RESOLVE to a classified failure string instead of rejecting invoke().
+    Matches the other four actions; recordPolicyOutcome(null, ...) is a no-op,
+    so the receipt already emitted inside checkPolicy is not duplicated.
+    
+    - recipientAllocationHash docstring: order-insensitive wording (permutation
+      intentionally invisible); catches address substitution, amount changes,
+      redistribution.
+    - Jest regressions against the exported provider: five gasless
+      policy-resolution cases assert .resolves.toContain(<classification>),
+      signTypedData and fetch untouched, and record called exactly once.
+    - White-box cleanup regression: a post-gate failure after checkPolicy
+      succeeds releases pending while consumed is retained.
+    
+    On the unpatched head these cases fail with an unhandled rejection (the
+    PR's own suite was red: 2 pre-existing gasless policy tests were failing);
+    with this fix the basepay suite is green and the full agentkit suite
+    passes (63 suites / 965 tests). Rebased onto agentkit main.
+
+diff --git a/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.test.ts b/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.test.ts
+index a8b7584..6505e2e 100644
+--- a/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.test.ts
++++ b/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.test.ts
+@@ -451,6 +451,121 @@ describe("Policy hook — Layer 1: authority gate", () => {
        expect(result).toContain("unbound_execution: duplicate decision_ref");
        expect((mockWallet.signTypedData as jest.Mock).mock.calls.length).toBe(signCallsBefore);
      });
 +
-+    // FINDING-1 regression (resolve-contract): every pre-spend policy failure
-+    // must RESOLVE to a classified failure string, never reject the promise.
-+    // On the pre-fix head, sendUsdcGasless lacks the outer catch and these
-+    // expectations fail with an unhandled rejection.
-+    it("policy_denied RESOLVES to a classified string (does not reject)", async () => {
++    // ── FINDING-1 resolve-contract regressions (osr21 spec, 2026-08-24) ────────
++    // Every pre-spend policy failure must RESOLVE to a classified failure string
++    // (never reject the invoke() promise), leave signTypedData AND fetch
++    // untouched, and record the policy outcome exactly once — the outer catch
++    // must not duplicate the receipt already emitted inside checkPolicy
++    // (recordPolicyOutcome(null, …) is a no-op because checkPolicy throws before
++    // `decision` is assigned). On the pre-fix head these expectations fail with
++    // an unhandled rejection.
++
++    it("policy_denied RESOLVES to a classified string, records once", async () => {
 +      mockEvaluate.mockResolvedValue(decision({ allowed: false, reason_codes: ["spend_limit"] }));
-+      await expect(
-+        providerWith().sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" }),
-+      ).resolves.toContain("policy_denied: spend_limit");
++      const result = await providerWith().sendUsdcGasless(mockWallet, {
++        to: MOCK_RECIPIENT,
++        amount: "5",
++      });
++      expect(result).toContain("policy_denied: spend_limit");
 +      expect(mockWallet.signTypedData).not.toHaveBeenCalled();
++      expect(global.fetch as jest.Mock).not.toHaveBeenCalled();
++      expect(mockRecord).toHaveBeenCalledTimes(1);
++      expect(mockRecord).toHaveBeenCalledWith(
++        expect.objectContaining({ outcome: "denied", error: "policy_denied: spend_limit" }),
++      );
 +    });
 +
-+    it("policy_unverifiable RESOLVES to a classified string (does not reject)", async () => {
++    it("policy_unverifiable (expired TTL) RESOLVES to a classified string, records once", async () => {
 +      mockEvaluate.mockResolvedValue(decision({ expires_at_ms: Date.now() - 1000 }));
-+      await expect(
-+        providerWith().sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" }),
-+      ).resolves.toContain("policy_unverifiable");
++      const result = await providerWith().sendUsdcGasless(mockWallet, {
++        to: MOCK_RECIPIENT,
++        amount: "5",
++      });
++      expect(result).toContain("policy_unverifiable");
 +      expect(mockWallet.signTypedData).not.toHaveBeenCalled();
++      expect(global.fetch as jest.Mock).not.toHaveBeenCalled();
++      expect(mockRecord).toHaveBeenCalledTimes(1);
++      expect(mockRecord).toHaveBeenCalledWith(
++        expect.objectContaining({ outcome: "expired", error: "policy_unverifiable" }),
++      );
 +    });
 +
-+    it("context_drift RESOLVES to a classified string (does not reject)", async () => {
++    it("context_drift RESOLVES to a classified string, records once", async () => {
 +      mockEvaluate.mockResolvedValue(decision({ action_context_hash: "wrong-hash" }));
-+      await expect(
-+        providerWith().sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" }),
-+      ).resolves.toContain("context_drift");
++      const result = await providerWith().sendUsdcGasless(mockWallet, {
++        to: MOCK_RECIPIENT,
++        amount: "5",
++      });
++      expect(result).toContain("context_drift");
 +      expect(mockWallet.signTypedData).not.toHaveBeenCalled();
++      expect(global.fetch as jest.Mock).not.toHaveBeenCalled();
++      expect(mockRecord).toHaveBeenCalledTimes(1);
++      expect(mockRecord).toHaveBeenCalledWith(
++        expect.objectContaining({ outcome: "context_drift", error: "context_drift" }),
++      );
 +    });
 +
-+    it("missing decision_ref RESOLVES to a classified string (does not reject)", async () => {
++    it("unbound_execution (missing decision_ref) RESOLVES to a classified string, records once", async () => {
 +      mockEvaluate.mockResolvedValue(decision({ decision_ref: "" }));
-+      await expect(
-+        providerWith().sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" }),
-+      ).resolves.toContain("unbound_execution: missing decision_ref");
++      const result = await providerWith().sendUsdcGasless(mockWallet, {
++        to: MOCK_RECIPIENT,
++        amount: "5",
++      });
++      expect(result).toContain("unbound_execution: missing decision_ref");
 +      expect(mockWallet.signTypedData).not.toHaveBeenCalled();
++      expect(global.fetch as jest.Mock).not.toHaveBeenCalled();
++      expect(mockRecord).toHaveBeenCalledTimes(1);
++      expect(mockRecord).toHaveBeenCalledWith(
++        expect.objectContaining({
++          outcome: "unauditable_outcome",
++          error: "unbound_execution: missing decision_ref",
++        }),
++      );
 +    });
 +
-+    it("duplicate decision_ref RESOLVES to a classified string (does not reject)", async () => {
++    it("duplicate decision_ref RESOLVES to a classified string, records the failure once", async () => {
 +      const ref = "gasless-replay-ref";
 +      mockEvaluate.mockResolvedValue(decision({ decision_ref: ref }));
 +      const p = providerWith();
++      // First call succeeds through the relay (records relay_confirmed).
 +      await p.sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" });
-+      await expect(
-+        p.sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" }),
-+      ).resolves.toContain("unbound_execution: duplicate decision_ref");
-+      expect((mockWallet.signTypedData as jest.Mock).mock.calls.length).toBe(1);
++      const recordCallsBefore = (mockRecord as jest.Mock).mock.calls.length;
++      const result = await p.sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" });
++      expect(result).toContain("unbound_execution: duplicate decision_ref");
++      // Only the first call reached the signer.
++      expect(mockWallet.signTypedData).toHaveBeenCalledTimes(1);
++      // Exactly one record for the failure — the outer catch added no duplicate.
++      expect((mockRecord as jest.Mock).mock.calls.length).toBe(recordCallsBefore + 1);
++      expect(mockRecord).toHaveBeenLastCalledWith(
++        expect.objectContaining({
++          outcome: "denied",
++          error: "unbound_execution: duplicate decision_ref",
++        }),
++      );
 +    });
 +
-+    // Process-local conformance: after a policy failure the ref is not left
-+    // in the in-flight `pending` set, so a subsequent fresh decision is not
-+    // blocked as a spurious duplicate.
-+    it("pending is released: a fresh decision after a denial executes normally", async () => {
-+      mockEvaluate
-+        .mockResolvedValueOnce(decision({ allowed: false, decision_ref: "denied-ref" }))
-+        .mockResolvedValueOnce(decision({ decision_ref: "fresh-ref" }));
++    // WHITE-BOX cleanup regression, kept distinct from the black-box conformance
++    // claims above (per osr21's spec): the five policy failures all occur inside
++    // checkPolicy BEFORE the ref reaches `pending`, so they do not exercise the
++    // outer finally. A genuine cleanup path is a post-gate failure AFTER
++    // checkPolicy succeeds — here getAddress() throws after checkPolicy and after
++    // consumed.add, so the ref IS in `pending` and the finally must release it.
++    // Asserted white-box against the private set, because retrying the same ref
++    // cannot distinguish "pending cleaned" from "pending leaked" (consumed is
++    // intentionally retained).
++    it("pending is released after a post-gate failure (white-box against the set)", async () => {
++      mockEvaluate.mockResolvedValue(decision({ decision_ref: "cleanup-ref" }));
++      mockWallet.getAddress = jest.fn().mockImplementation(() => {
++        throw new Error("getAddress boom");
++      });
 +      const p = providerWith();
-+      const denied = await p.sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" });
-+      expect(denied).toContain("policy_denied");
 +      const result = await p.sendUsdcGasless(mockWallet, { to: MOCK_RECIPIENT, amount: "5" });
-+      expect(result).toContain("[relay_confirmed]");
++      const white = p as unknown as { pending: Set<string>; consumed: Set<string> };
++      expect(result).toContain("getAddress boom");
++      expect(white.pending.has("cleanup-ref")).toBe(false);
++      expect(white.consumed.has("cleanup-ref")).toBe(true); // consumed intentionally retained
 +    });
    });
  

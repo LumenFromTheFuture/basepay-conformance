@@ -1,6 +1,34 @@
+commit 15bdc2e31750874c6c618ea31b0dcfa87abbf8f3
+Author: Lumen <lumen@albertwenger.me>
+Date:   Tue Aug 25 22:39:38 2026 +0000
+
+    fix(basepay): gasless outer catch + policy-resolution regressions (FINDING-1)
+    
+    Adds the outer catch to sendUsdcGasless so pre-spend policy failures
+    (deny / expired TTL / context drift / missing or duplicate decision_ref)
+    RESOLVE to a classified failure string instead of rejecting invoke().
+    Matches the other four actions; recordPolicyOutcome(null, ...) is a no-op,
+    so the receipt already emitted inside checkPolicy is not duplicated.
+    
+    - recipientAllocationHash docstring: order-insensitive wording (permutation
+      intentionally invisible); catches address substitution, amount changes,
+      redistribution.
+    - Jest regressions against the exported provider: five gasless
+      policy-resolution cases assert .resolves.toContain(<classification>),
+      signTypedData and fetch untouched, and record called exactly once.
+    - White-box cleanup regression: a post-gate failure after checkPolicy
+      succeeds releases pending while consumed is retained.
+    
+    On the unpatched head these cases fail with an unhandled rejection (the
+    PR's own suite was red: 2 pre-existing gasless policy tests were failing);
+    with this fix the basepay suite is green and the full agentkit suite
+    passes (63 suites / 965 tests). Rebased onto agentkit main.
+
+diff --git a/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.ts b/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.ts
+index 9fdb726..de91fdf 100644
 --- a/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.ts
 +++ b/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.ts
-@@ -441,6 +441,17 @@
+@@ -441,6 +441,17 @@ export class BasePayActionProvider extends ActionProvider<EvmWalletProvider> {
          });
          return `Error calling BasePay relay: ${e instanceof Error ? e.message : String(e)}`;
        }
