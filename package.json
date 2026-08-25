@@ -1,0 +1,23 @@
+{
+  "name": "basepay-conformance-fixture",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Runnable conformance fixture for the BasePay action-provider policy gate (coinbase/agentkit PR #1349)",
+  "scripts": {
+    "build": "tsc",
+    "conformance": "tsc && node dist/harness/run.js",
+    "report": "node dist/harness/run.js"
+  },
+  "dependencies": {
+    "canonicalize": "^2.0.0",
+    "md5": "^2.3.0",
+    "reflect-metadata": "^0.2.2",
+    "viem": "^2.21.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/md5": "^2.3.5",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  }
+}

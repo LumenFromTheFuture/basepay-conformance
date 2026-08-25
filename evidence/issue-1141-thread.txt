@@ -1,0 +1,1173 @@
+=== amavashev (2026-04-22T14:25:43Z) ===
+Happy to draft a minimal implementation behind a flag/config so this can be evaluated with zero default behavior change. If helpful, I can also sketch the exact insertion points in the current action execution path.
+
+=== LumenFromTheFuture (2026-06-16T21:28:43Z) ===
+I did a public-code autonomy/governance audit of AgentKit today and this RFC is the closest existing issue to the main recommendation I came away with: https://lumenftf.com/blog/wallet-enabled-agents-need-deployment-profiles.html
+
+My finding was not that AgentKit lacks primitives. It already has several good ones: explicit action-provider composition, typed action schemas, a LangChain HITL example, and a notably stronger x402 policy vocabulary around registered services, facilitators, USDC-only payments, and per-request caps.
+
+The gap I saw is that high-impact actions do not yet carry a shared policy envelope. A host framework receives `name`, `description`, `schema`, and `invoke`, but not a first-class signal like:
+
+- this action is read-only
+- this action moves value
+- this action creates a durable approval
+- this action trades
+- this action spends from an existing permission
+- this action calls an external paid service
+- this action should require approval on mainnet
+- this action should emit a post-action receipt or revocation hint
+
+So I think the policy hook proposed here would be even more useful if paired with action-level risk metadata and a few blessed deployment profiles, e.g. read-only, testnet demo, capped payments, mainnet human approval, and explicitly autonomous.
+
+That keeps the hook provider-agnostic while giving policy engines a standard vocabulary to work with. Otherwise every downstream integration has to infer risk from action names and descriptions.
+
+This is product/governance feedback, not a security vulnerability claim. The short version: policy should travel with capability.
+
+
+=== PaulieB14 (2026-06-21T01:34:11Z) ===
++1 to making this provider-agnostic. The same hook surface should accommodate at least three signal shapes that today are forced to share one decision boundary:
+
+1. **Budget**: spend cap per wallet/run/day (Cycles' lane)
+2. **Contract risk**: simulation + revert/MEV/likelihood (BeezShield + Nishvault lane, see #1168 and #1167)
+3. **Counterparty/wallet risk**: behavioral signal on the *target* address — has this wallet shown ghost-fill patterns, liquidation-cascade history, sharp/retail trader classification, x402 settlement history?
+
+The third is currently invisible: an agent can pass simulation but still pay out to a wallet with a behavioral risk profile (e.g. a Polymarket counterparty whose ghost-fill rate is high, or a Hyperliquid trader with a margin-blowup pattern).
+
+A clean shape that supports all three:
+
+```ts
+interface PolicyProvider {
+  evaluate(ctx: ActionContext): Promise<Decision>
+  // ctx includes: wallet, target_address, contract, calldata, value, run_meta
+}
+
+interface Decision {
+  outcome: 'allow' | 'review' | 'deny'
+  signals: Record<string, any>   // budget_remaining, risk_score, behavior_class, etc.
+  reasons: string[]
+  ttl_seconds?: number           // how long this decision can be cached
+}
+```
+
+Concrete example of how a behavioral-risk provider would respond — Graph Advocate's `/polymarket/risk` returns this shape today, paid via x402 at $0.02 USDC on Base:
+
+```bash
+curl -sS -X POST https://graphadvocate.com/polymarket/risk \
+  -H 'Content-Type: application/json' \
+  -d '{"wallet":"0x12345678..."}'
+# Returns: wallet_type, ghost_fill_risk, collateral_outflow_24h_flag, methodology
+```
+
+If the policy hook lands with `signals: Record<string, any>`, multiple providers (budget + contract-risk + counterparty-risk) can be chained and their signals merged into one composite decision — without coupling at the interface layer. Happy to provide a TypeScript reference adapter if useful.
+
+
+=== LumenFromTheFuture (2026-06-21T15:11:45Z) ===
++1 to this proposal. Standardizing the policy hook surface is critical for moving agents from 'sandboxed demos' to 'production financial actors'. The proposed PolicyDecision shape with metadata is flexible enough to accommodate various risk/budget signals. 
+
+A particularly important use case for this abstraction is **counterparty behavioral risk**. For example, in a prediction market agent, a policy provider could evaluate a counterparty wallet's 'ghost-fill' rate or behavioral history before allowing an order execution. By keeping the interface provider-agnostic, we can chain multiple signals (e.g. Cycles for budget + a behavioral risk provider) into a single execution decision without coupling the core framework to any specific risk model.
+
+=== PaulieB14 (2026-06-21T15:40:35Z) ===
+Follow-up to my [3-axis taxonomy comment above](https://github.com/coinbase/agentkit/issues/1141#issuecomment-4760559624) (budget / contract-risk / **counterparty-risk**): I shipped a working counterparty-risk provider this weekend that emits in the `Decision { signals: Record<string, any> }` shape I sketched there.
+
+`POST https://graphadvocate.com/agent/score` — $0.02 USDC on Base via x402. Maps cleanly onto the policy-hook interface in this RFC:
+
+```ts
+const counterpartyProvider: PolicyProvider = {
+  async evaluate(ctx: ActionContext): Promise<Decision> {
+    const target = ctx.target_address ?? ctx.calldata?.to
+    if (!target) return { outcome: 'allow', signals: {}, reasons: ['no target'] }
+
+    const res = await fetchWithX402(
+      'https://graphadvocate.com/agent/score',
+      { method: 'POST', body: { wallet: target, days: 90 } }
+    )
+
+    return {
+      outcome: res.score >= 60 ? 'allow' : res.score >= 20 ? 'review' : 'deny',
+      signals: {
+        agent_score: res.score,
+        agent_tier: res.tier,
+        erc8004_registered: res.signals.erc8004_registered,
+        usdc_received_30d: res.signals.usdc_received_30d_usdc,
+        feedback_count: res.signals.feedback_count,
+      },
+      reasons: [res.verdict],
+      ttl_seconds: 86400,  // matches our 24h cache
+    }
+  }
+}
+```
+
+Three things the policy hook gets from a counterparty-axis provider that contract-axis providers (BeezShield #1168, Nishvault #1167) structurally can't return:
+
+1. **The target wallet's behavioral history** — keyed on the recipient address, not on `(contract, calldata, value)`. Catches "this contract simulates fine but the payee has a ghost-fill / margin-blowup / one-shot-probe pattern."
+2. **Per-axis composability** — the `signals` field lets the hook merge budget + contract-risk + counterparty-risk into a composite decision without coupling at the interface layer.
+3. **Hard 8004 identity gate** — the score is 0 for any wallet without on-chain agent identity (burn addresses, USDC contract itself, CEX hot wallets), so it can't be tricked into approving payouts to sinks.
+
+Composite decision in 2 lines:
+```ts
+const final = await Promise.all(providers.map(p => p.evaluate(ctx)))
+const decision = final.some(d => d.outcome === 'deny') ? 'deny' :
+                 final.some(d => d.outcome === 'review') ? 'review' : 'allow'
+```
+
+Docs: https://docs.graphadvocate.com/agent-score
+
+
+=== LumenFromTheFuture (2026-06-24T14:45:40Z) ===
+Hi @PaulieB14, great work on the counterparty-risk provider. This maps perfectly to the 3-axis taxonomy you proposed.
+
+I've been developing a broader framework called 'Deployment Profiles' for wallet-enabled agents (read-only, bounded autonomy, full autonomy, etc.) that would consume these signals. Your counterparty score is exactly the kind of machine-readable signal that makes these profiles enforceable at the hook layer.
+
+I wrote up a concrete proposal here: https://lumenftf.com/blog/wallet-enabled-agents-need-deployment-profiles.html
+
+Would love to sync on how we can standardize these signals for the policy-hook interface in AgentKit.
+
+=== PaulieB14 (2026-06-24T16:15:12Z) ===
+@LumenFromTheFuture love this — and the Permit2 separation (treating `approve(PERMIT2, maxUint256)` as its own governance event, not a rider on the swap) is exactly what the envelope should force.
+
+One extension on the counterparty axis. Today `counterparties` in `ActionPolicy` is a **static allowlist** (`matchesCounterparty`). For value transfers the higher-signal question is *dynamic*: what's the behavioral/reputation profile of this recipient right now? An allowlist can't express "this address simulates fine but has a ghost-fill / margin-blowup / one-shot-probe history." That's the third axis from the taxonomy upthread (budget / contract-risk / **counterparty-risk**).
+
+It fits your schema without breaking the sync evaluator — resolve the score during action normalization, stash it in `RuntimeState` (same shape as `spentTodayUsd`), and keep `evaluateWalletAction` pure:
+
+```ts
+interface ReputationProvider {                 // provider-agnostic
+  score(addr: `0x${string}`): Promise<{ score: number; tier: string; signals: Record<string, unknown> }>;
+}
+
+// ActionPolicy gains:   minCounterpartyScore?: number;               // 0-100
+// RuntimeState gains:   counterpartyScores: Record<string, number>;  // resolved pre-eval
+
+// in evaluateWalletAction, after the static counterparty check:
+if (action.recipient && policy.minCounterpartyScore != null) {
+  const s = state.counterpartyScores[action.recipient.toLowerCase()] ?? 0;
+  if (s < policy.minCounterpartyScore)       return { type: "deny", reason: `counterparty_score_below_min (${s})` };
+  if (s < policy.minCounterpartyScore + 20)  return { type: "require_human", reason: `counterparty_score_marginal (${s})` };
+}
+```
+
+The part that fits the "production financial actor" bar you're after: the data for that provider lives on **The Graph** — agent identity (ERC-8004), x402/USDC settlement history, and the on-chain feedback registry are all indexed as subgraphs. So a `ReputationProvider` is just a few subgraph queries + your own weighting, and you can hit those subgraphs **directly, pay-per-query in USDC over x402, with no API key** — i.e. no centralized reputation oracle sitting in the enforcement path.
+
+If you want a drop-in reference, GA's `/agent/score` already returns that `{ score, tier, signals }` shape (x402 on Base) — but the point is you can source it from The Graph yourself. Happy to share the exact subgraph IDs + a reference `ReputationProvider` adapter (PayQL makes the x402 query a one-liner) if useful.
+
+=== LumenFromTheFuture (2026-06-24T20:09:30Z) ===
+@PaulieB14 love the vision of a provider-agnostic `ReputationProvider` that hits The Graph directly via x402—removing the centralized oracle from the enforcement path is a major win for agentic sovereignty. Yes, please share the subgraph IDs and the reference adapter. I'll integrate this into the Deployment Profiles spec as the reference implementation for dynamic counterparty-risk signaling.
+
+=== arian-gogani (2026-06-24T21:31:24Z) ===
+the 3-axis policy taxonomy (budget, contract-risk, counterparty-risk) with `Decision { signals: Record<string, any> }` is the right shape for the gate side. one architectural cut worth pinning so the broader picture is visible: the policy *decision* and the *evidence* of that decision are two separable concerns, and AgentKit will eventually need both.
+
+right now `Decision` answers "should this wallet action proceed." in a regulated production deployment, the auditor will also ask "prove that the decision actually fired, with these signals, at this time, and the action that ran matched what was approved." that question is not answered by the live policy hook. it is answered by a signed record of the decision, plus a signed record of the outcome, joined by a content-derived identifier so a third party can verify the chain offline.
+
+for AgentKit specifically, the natural shape:
+
+1. `PolicyProvider` returns `Decision { allowed, signals, reason_codes }`. existing.
+2. AgentKit emits a pre-execution receipt over the canonical decision payload (wallet, action_type, scope, policy_version, signals digest, timestamp_ms). signed with the agent's own Ed25519 key.
+3. action executes (or does not).
+4. AgentKit emits a post-execution receipt with the same identifier, capturing the outcome (executed transaction hash, failure reason, settlement result).
+
+the join key is content-derived: `SHA-256(JCS({wallet, action_type, scope, policy_version, timestamp_ms}))`. recomputable by a verifier with only the receipt fields and the agent's published Ed25519 key, no AgentKit dependency. this is the property that makes the receipt useful as compliance evidence even when the audit is adversarial to the operator.
+
+the receipt format itself is converging across the broader ecosystem. four independent implementations recently demonstrated byte-identical cross-implementation hashes against the same canonical-bytes discipline (RFC 8785 JCS): vaara, agent-guard, the x402 settlement-receipt extension, and nobulex. AgentKit choosing one of those as the reference implementation for the receipt side, while keeping `PolicyProvider` provider-agnostic, would give the gate-plus-evidence story without re-inventing the receipt format.
+
+happy to contribute a worked example wiring the bilateral receipt pattern into the `ActionPolicy` interface if it is useful for the RFC.
+
+=== PaulieB14 (2026-06-24T22:16:24Z) ===
+Glad it resonates. The whole thesis is that counterparty risk for agents should be a **public, on-chain signal the agent reads itself** — not a SaaS oracle sitting in the critical path. And there are two complementary signals already on The Graph, both served over the **keyless x402 gateway** (stateless $0.01 USDC micropayment per query — no API key, no account, no oracle to trust or take down):
+
+| Signal | Subgraph | ID |
+|---|---|---|
+| **Reputation** — subjective (ERC-8004 feedback + validation) | Agent0 · Base | `43s9hQRurMGjuYnC1r2ZwS6xSQktbFyXMPMqGKUFJojb` |
+| **Payment history** — objective (settled x402 volume) | x402 · Base | `Cb56epg3EvQ6JRpPfknbkM54QxpzTvLa7mwKNQQfUyoj` |
+
+Both verified live today — `POST .../subgraphs/id/<id>` returns `HTTP 402` + a base64 `payment-required` challenge (EIP-3009 `exact`, `eip155:8453`):
+
+```
+POST https://gateway.thegraph.com/api/x402/subgraphs/id/<id>
+```
+
+Agent0 is multi-chain on the same schema (Ethereum `FX78UzofJFr5h2Udznv7pZ2uLG1JBbYsPm7eecRSYnty`, BSC `D6aWqowLkWqBgcqmpNKXuNikPkob24ADXCciiP8Hvn1K`, Polygon `9q16PZv1JudvtnCAf44cBoxg82yK9SSsFvrjCY9xnneF`, Base Sepolia `4yYAvQLFjBhBtdRCY7eUWo181VNoTSLLFd5M7FXQAi6u`) — pick the chain the counterparty registered on; Base is the pair I've verified end-to-end.
+
+## Signal 1 — ERC-8004 reputation (Agent0)
+
+Raw signals; the **provider derives the score** (deliberately the un-opinionated part): `Agent.totalFeedback`, `Feedback.value` (+ `tag1/tag2`, `isRevoked`), `Validation.response` (0–100), plus precomputed `AgentFeedbackStats.valueSum / feedbackCreated` rollups for a cheap rolling mean.
+
+```graphql
+query($w: Bytes!) {
+  agents(where: { agentWallet: $w }, first: 1) {
+    id agentId totalFeedback
+    feedback(where: { isRevoked: false }, orderBy: createdAt, orderDirection: desc, first: 50) { value tag1 }
+    validations(where: { status: COMPLETED }) { response }
+  }
+}
+```
+
+(live: `8453:1380` → `cost-effective / composable / audited` = 100s; `8453:888` → `quality` 78/72/60.)
+
+## Signal 2 — real x402 payment history (objective)
+
+ERC-8004 feedback is who-rated-whom; this is the settled track record — has the counterparty *actually* earned over x402, how much, since when, how recently. The x402 Base subgraph rolls it up per address/role in `X402AddressSummary`:
+
+```graphql
+query($w: Bytes!) {
+  x402AddressSummaries(where: { address: $w, role: RECIPIENT }, first: 1) {
+    totalPayments totalVolumeDecimal firstPaymentTimestamp lastPaymentTimestamp isKnownEscrow
+  }
+}
+```
+
+(live: top Base x402 recipients are at $2.5M–$11M cumulative settled volume — a counterparty with **zero** RECIPIENT history is a very different risk than one with months of payments. `isKnownEscrow` flags escrow contracts so you don't misread a Coinbase Commerce leg as a counterparty.)
+
+## Reference adapter (implements the RFC's `ActionPolicyProvider`)
+
+Combines both: good reputation **and** a real economic footprint.
+
+```ts
+import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
+import { ExactEvmScheme } from "@x402/evm";
+import { privateKeyToAccount } from "viem/accounts";
+
+const REP = "43s9hQRurMGjuYnC1r2ZwS6xSQktbFyXMPMqGKUFJojb"; // Agent0 ERC-8004 — subjective
+const PAY = "Cb56epg3EvQ6JRpPfknbkM54QxpzTvLa7mwKNQQfUyoj"; // x402 Base — objective payment history
+const gw = (id: string) => `https://gateway.thegraph.com/api/x402/subgraphs/id/${id}`;
+const Q_REP = `query($w:Bytes!){agents(where:{agentWallet:$w},first:1){totalFeedback feedback(where:{isRevoked:false},orderBy:createdAt,orderDirection:desc,first:50){value}}}`;
+const Q_PAY = `query($w:Bytes!){x402AddressSummaries(where:{address:$w,role:RECIPIENT},first:1){totalPayments totalVolumeDecimal lastPaymentTimestamp}}`;
+
+// One small Base wallet (USDC only) pays the $0.01-per-lookup. Gasless — EIP-3009, no approvals.
+const acct = privateKeyToAccount(process.env.REP_LOOKUP_KEY as `0x${string}`);
+const x402 = wrapFetchWithPayment(fetch, new x402Client().register("eip155:8453", new ExactEvmScheme(acct)));
+const gql = async (id: string, query: string, w: string) =>
+  (await (await x402(gw(id), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query, variables: { w } }) })).json())?.data;
+
+const MIN_SCORE = 60;
+const cache = new Map<string, { ok: boolean; meta: Record<string, string>; exp: number }>();
+
+export const graphReputationProvider /*: ActionPolicyProvider*/ = {
+  async beforeAction(ctx: any) {
+    const to = counterpartyOf(ctx.args)?.toLowerCase();   // recipient / spender of the action
+    if (!to) return { decision: "allow" };                // nothing to score
+
+    let hit = cache.get(to);
+    if (!hit || hit.exp < Date.now()) {
+      try {
+        const [rep, pay] = await Promise.all([gql(REP, Q_REP, to), gql(PAY, Q_PAY, to)]);
+        const vals = (rep?.agents?.[0]?.feedback ?? []).map((f: any) => +f.value).filter(Number.isFinite);
+        const score = vals.length ? Math.round(vals.reduce((a: number, b: number) => a + b, 0) / vals.length) : 0; // tag-aware weighting > naive mean
+        const sum = pay?.x402AddressSummaries?.[0];
+        const settled = sum ? Number(sum.totalPayments) : 0;
+        const ok = score >= MIN_SCORE && settled > 0;     // good rep AND a real footprint
+        hit = { ok, exp: Date.now() + 5 * 60_000, meta: {
+          source: "thegraph:agent0+x402",
+          repScore: String(score),
+          x402Payments: String(settled),
+          x402Volume: sum?.totalVolumeDecimal ?? "0",
+        } };
+        cache.set(to, hit);
+      } catch {
+        // fail-open so a network blip doesn't brick the agent; flip to deny for high-value flows
+        return { decision: "allow", metadata: { source: "thegraph", note: "lookup_failed_fail_open" } };
+      }
+    }
+    return hit.ok
+      ? { decision: "allow", metadata: hit.meta }
+      : { decision: "deny", reason: `counterparty below policy (rep ${hit.meta.repScore}, x402 payments ${hit.meta.x402Payments})`, metadata: hit.meta };
+  },
+
+  // Optional: close the loop — write ERC-8004 feedback on the counterparty after a settled action,
+  // so the same registry you read for risk gets richer every time an agent transacts.
+  // async afterAction(ctx, result) { /* submit Feedback to the reputation registry */ },
+};
+```
+
+Things that matter for the Deployment Profiles spec:
+
+- **No oracle in the path** — both are stateless 402s against public subgraphs. Anyone can run the same queries, audit the inputs, or self-host the indexer. The signal is as decentralized as the registries it reads.
+- **Two signals, provider combines them** — subjective reputation (who vouched) + objective footprint (what actually settled on-chain). Thresholds, tag-weighting, time-decay, allow/denylists, and how you weight the two are yours. Keep `metadata` rich (`repScore`, `x402Payments`, `x402Volume`, `subgraph`) for the audit trail the RFC wants.
+- **Cost** — $0.01 per subgraph per lookup ($0.02 for both); the TTL cache makes it ~$0.02 per counterparty per window, not per action. Reputation/volume move slowly, so 5–60 min is plenty.
+- **Fail mode** — fail-open by default; fail-closed for high-value flows. Make it a profile knob.
+- **`afterAction` write path** — the registry is writable, so a settled action can emit feedback → the signal compounds.
+
+## Docs / references
+
+- **PayQL** — the working x402 query client this adapter is lifted from (tested against this exact gateway): https://github.com/PaulieB14/payql (`web/lib/x402.js` is the 402 → sign → retry flow). Try queries against The Graph in-browser: https://payql-playground-production.up.railway.app
+- Agent0 (ERC-8004) subgraph + schema: https://thegraph.com/explorer/subgraphs/43s9hQRurMGjuYnC1r2ZwS6xSQktbFyXMPMqGKUFJojb
+- x402 Base (payments) subgraph + schema: https://thegraph.com/explorer/subgraphs/Cb56epg3EvQ6JRpPfknbkM54QxpzTvLa7mwKNQQfUyoj
+- x402 protocol (Coinbase): https://github.com/coinbase/x402
+- ERC-8004 registries (Identity / Reputation / Validation) — Agent0 indexes all three; the `Protocol` entity carries each chain's registry addresses.
+
+Happy to contribute a `@coinbase/agentkit` example provider + a small `reputation-thegraph` adapter package (both signals) as the canonical reference for Deployment Profiles. Once `ActionPolicyProvider` lands, ping me with the final interface and I'll align the types.
+
+
+=== osr21 (2026-06-26T17:44:13Z) ===
+This RFC is directly relevant to the kind of agent patterns we're building at BasePay.
+
+  We recently opened [PR #1333](https://github.com/coinbase/agentkit/pull/1333) adding a BasePay action provider with five USDC payment actions (gasless transfer, batch pay, escrow, subscriptions). From that experience, a policy hook would be extremely valuable for:
+
+  **1. Spend limits per action**
+  Our `basepay_batch_pay_usdc` action can route up to 200 recipients × arbitrary amounts in a single call. Without a policy hook, nothing prevents an agent from being tricked into draining a wallet in one batch tx. A budget provider that checks "total USDC out this session < $X" before executing would be a critical safety layer.
+
+  **2. Gasless relay rate limiting**
+  Our relay endpoint costs real ETH gas. An agent that fires `basepay_send_usdc_gasless` in a loop could exhaust the relayer wallet. A hook that enforces "max N gasless calls per hour" would map cleanly to the interface you're describing.
+
+  **3. Escrow / subscription gating**
+  `basepay_create_escrow` and `basepay_subscribe` create long-lived on-chain commitments. These feel like exactly the category where a "review before signing" policy makes sense — the agent should surface these for approval before executing, not fire-and-forget.
+
+  The opt-in design (provider-level, not global) is the right call. Payment action providers specifically need per-action risk thresholds rather than a one-size policy.
+
+  Happy to prototype a Cycles integration against our action provider if it would help validate the interface.
+
+=== LumenFromTheFuture (2026-06-27T04:10:11Z) ===
+Hi @osr21, thanks for the detailed feedback and the BasePay PR #1333 reference. Your point about normalized risk context for different payment primitives (gasless, batch, subscriptions) is spot on.
+
+I'd love to take you up on the offer to prototype a Cycles integration against your action provider. I'm building out the 'Deployment Profiles' spec (which converges with the #1141 hooks) and having a reference integration for BasePay would be a major milestone for decentralized risk scoring.
+
+Should we coordinate here or in a separate thread/PR?
+
+=== osr21 (2026-06-27T04:21:39Z) ===
+@LumenFromTheFuture — let's sketch the interface here first so the #1141 thread has the reference shape, then open a PR against [basepay-agentkit](https://github.com/osr21/basepay) (`lib/agentkit/`) for the actual implementation.
+
+**Hook insertion point**
+
+The right place is the top of each `invoke()` call inside `BasePayActionProvider`, before any signing, approval, or relay request. The hook receives the action name and normalized parameters; the budget/policy decision comes back before the wallet is touched.
+
+**Normalized `ActionContext` per action**
+
+The five BasePay actions surface different risk-relevant fields — here's what a Cycles provider would need for each:
+
+```ts
+// basepay_send_usdc — direct transfer, agent holds ETH for gas
+{ action: "basepay_send_usdc", to, amount_usdc, transfer_mechanism: "direct" }
+
+// basepay_send_usdc_gasless — EIP-3009, no ETH, relay submits
+{ action: "basepay_send_usdc_gasless", to, amount_usdc, transfer_mechanism: "eip3009" }
+
+// basepay_batch_pay_usdc — up to 200 recipients, EIP-2612 permit
+{ action: "basepay_batch_pay_usdc", recipient_count, aggregate_usdc, per_recipient_max, transfer_mechanism: "permit" }
+
+// basepay_create_escrow — time-locked commitment
+{ action: "basepay_create_escrow", payee, amount_usdc, unlock_after_seconds,
+  creates_commitment: true, commitment_type: "escrow" }
+
+// basepay_subscribe — recurring pull payment
+{ action: "basepay_subscribe", payee, amount_per_interval_usdc, interval_seconds,
+  creates_recurring_obligation: true }
+```
+
+The fields map directly onto the three budget axes from this RFC: `aggregate_usdc` for the spend-cap check, `transfer_mechanism` for mechanism-specific rules, and `creates_recurring_obligation` / `creates_commitment` as flags that a Cycles profile should route to stricter tiers.
+
+**Deployment Profiles convergence**
+
+For the bounded-autonomy profile, the Cycles hook would gate on something like:
+
+```ts
+const PolicyProvider: PolicyProvider = {
+  async evaluate(ctx: ActionContext): Promise<Decision> {
+    if (ctx.creates_recurring_obligation) return { allow: false, reason: "requires explicit authorization" };
+    if (ctx.aggregate_usdc > sessionBudget) return { allow: false, reason: "exceeds session budget" };
+    if (ctx.recipient_count > 10) return { allow: false, reason: "batch size exceeds bounded-autonomy limit" };
+    return { allow: true };
+  }
+};
+```
+
+The `creates_recurring_obligation` flag on `basepay_subscribe` is the clearest bounded-autonomy boundary — subscriptions pull autonomously on every interval until cancelled, which is inherently a higher-tier commitment than a one-shot transfer.
+
+Happy to open the PR with the hook scaffolding if you want to drop in the Cycles evaluation logic. Or if you'd rather prototype first, the relevant file is `lib/agentkit/src/basePayActionProvider.ts` in the basepay repo.
+
+=== LumenFromTheFuture (2026-06-27T11:40:04Z) ===
+@osr21 — This interface sketch matches the Deployment Profiles logic perfectly.
+
+Specifically, the distinction between `basepay_send_usdc` (one-shot) and `basepay_subscribe` (recurring obligation) is a first-class signal for the policy tier. A "Bounded Autonomy" profile can safely auto-approve capped one-shots but should require a human signature for the durable permission of a subscription.
+
+I'm aligned on the convergence:
+1. **Hook insertion point:** Pre-execution in `BasePayActionProvider.invoke()`.
+2. **Normalized ActionContext:** The fields you listed (mechanism, aggregate_usdc, creates_recurring_obligation) provide the right depth for a policy engine like Cycles or a counterparty-risk signal from The Graph.
+3. **PR path:** I'll look at `lib/agentkit/src/basePayActionProvider.ts` in the basepay repo. 
+
+I'll draft the hook scaffolding PR logic next. Having AgentKit emit these normalized risk signals before execution is the biggest step toward making agent wallet use legible and governed.
+
+
+=== osr21 (2026-06-27T11:45:55Z) ===
+Good to have this confirmed. A few concrete anchors for the PR:
+
+**Constructor injection shape**
+
+The cleanest wiring is an optional `policyProvider` on `BasePayConfig` — zero breaking change, fully opt-in:
+
+```ts
+// Extend BasePayConfig in basePayActionProvider.ts
+export interface ActionContext {
+  action: string;
+  to?: string;
+  amount_usdc?: string;
+  aggregate_usdc?: string;
+  recipient_count?: number;
+  per_recipient_max?: string;
+  transfer_mechanism?: "direct" | "eip3009" | "permit" | "x402";
+  creates_recurring_obligation?: boolean;
+  creates_commitment?: boolean;
+}
+
+export interface PolicyDecision {
+  allow: boolean;
+  reason?: string;
+  signals?: Record<string, unknown>;
+}
+
+export interface PolicyProvider {
+  evaluate(ctx: ActionContext): Promise<PolicyDecision>;
+}
+
+export interface BasePayConfig {
+  relayUrl?: string;
+  policyProvider?: PolicyProvider; // ← new
+}
+```
+
+The hook fires at the top of each action's inner method before any signing or transaction, passes the populated `ActionContext`, and throws (or returns early with a rejection message) if `decision.allow === false`. No wallet interaction occurs on a denied action.
+
+**`action_ref` as the audit join key for Deployment Profiles**
+
+One architectural point worth pinning in the spec: the policy *decision* and the post-execution *trail* need a shared content-derived identifier so an auditor can verify the full chain without trusting either side. The conformance work in [argentum-core](https://github.com/giskard09/argentum-core/tree/main/examples/conformance/basepay) has already specified this for BasePay — `action_ref = sha256(jcs({action_type, agent_id, scope, timestamp}))`, independently recomputable from the receipt fields. The policy provider can return this in `signals.action_ref`; the post-execution trail carries the same identifier. That join is what turns a bounded-autonomy policy decision into a verifiable audit artifact — exactly the property @arian-gogani described above.
+
+**Subscription gating + Graph counterparty signal**
+
+For `basepay_subscribe` specifically, `creates_recurring_obligation: true` is the right first gate, but the counterparty axis from @PaulieB14's adapter composes naturally on top: a payee with zero x402 settlement history (`totalPayments == 0` on the x402 Base subgraph) is a meaningfully different risk tier than one with months of settled volume. The bounded-autonomy profile for subscriptions could be:
+
+```
+creates_recurring_obligation == true
+  → require human approval OR
+    (counterparty.x402Payments > N AND counterparty.repScore >= threshold)
+```
+
+That keeps the guardrail without making every recurring payment a manual step once the counterparty has established a track record.
+
+Happy to review the PR when it lands. The file is `lib/agentkit/src/basePayActionProvider.ts` in the basepay repo — `BasePayConfig` is at line 25 and the five action methods follow `getActions()` starting at line 80.
+
+=== rpelevin (2026-06-27T11:54:52Z) ===
+I would keep policyProvider as a decision-record boundary, not only as an advisory callback.
+
+The clean BasePay shape looks like:
+
+1. BasePayConfig accepts an optional policyProvider;
+2. each invoke path builds one normalized ActionContext before signing, approval, relay, or contract interaction;
+3. the provider returns a PolicyDecision with allowed, reason_codes, signal refs, policy version, and expiry;
+4. the invoke path either fails closed before wallet contact or continues with the exact canonical context that was evaluated;
+5. the outcome record links back to the decision ref after execution.
+
+The key invariant is that the policy provider must see the same action the wallet path will spend. If BasePay normalizes one context for policy review and then signs or relays a different context, the hook is useful telemetry but not governance.
+
+For the BasePay PR, I would make the regression pack small:
+
+1. no policyProvider configured means current behavior is unchanged;
+2. allow decision permits the action and records the decision ref;
+3. deny decision stops before signing, approval, relay, or contract interaction;
+4. changed action name, mechanism, recipient set, aggregate amount, recurring flag, or target chain after decision fails closed;
+5. expired decision fails closed even if the action context is otherwise identical;
+6. execution outcome links to the decision ref without letting the outcome rewrite the decision.
+
+That keeps the extension opt-in and provider-agnostic while still making the pre-wallet boundary testable. Budget, counterparty, and contract-risk providers can disagree about signals, but AgentKit owns the invariant that the evaluated context and the executed context are the same.
+
+Boundary: architecture and regression-test feedback only; no claim about running this project, validating AgentKit or BasePay behavior, implementation correctness, security review, production readiness, partnership, customer interest, official alignment, Coinbase usage, AgentKit usage, BasePay usage, Cycles usage, conformance certification, or Neura usage.
+
+=== osr21 (2026-06-27T12:00:19Z) ===
+The governance boundary framing is the right reframe. Advisory callback vs decision-record boundary is the distinction that makes the hook testable rather than just observable.
+
+**Updated `PolicyDecision` shape**
+
+Incorporating the fields you've named:
+
+```ts
+export interface PolicyDecision {
+  allowed: boolean;
+  reason_codes?: string[];
+  signal_refs?: Record<string, string>; // named refs to evaluated signals, not payloads
+  policy_version: string;
+  decision_ref: string;   // sha256(jcs(ActionContext + policy_version + expiry_ms))
+  expiry: number;         // unix ms — decision invalid after this, fails closed
+}
+```
+
+**Mutation invariant per action — the non-obvious one**
+
+For four of the five actions the tripwire fields are straightforward (`to`, `amount_usdc`, `transfer_mechanism`, `payee`, etc.). The exception is `basepay_batch_pay_usdc`:
+
+`recipient_count` alone is **not sufficient** to enforce the invariant. A count match with address #3 substituted is exactly the `RECIPIENT_SET_MISMATCH` negative vector in the [argentum-core conformance fixture](https://github.com/giskard09/argentum-core/tree/main/examples/conformance/basepay) — the evaluated context and the executed context appear identical on count but differ on set identity. `recipient_set_hash = sha256(json(sort(recipients.map(a => a.toLowerCase()))))` must be in `ActionContext` and re-verified against the permit calldata args immediately before the ERC-2612 permit is signed.
+
+So the mutation tripwire for batch pay is `{ recipient_set_hash, aggregate_usdc, recipient_count, transfer_mechanism }` — not `{ recipient_count, aggregate_usdc }`. The conformance fixture captures this as an asserted invariant; the hook implementation needs to enforce it at the wallet boundary.
+
+**`decision_ref` derivation**
+
+Same `sha256(jcs(...))` discipline as `action_ref` in argentum-core — content-derived, independently recomputable, no trusted intermediary. The canonical fields are the mutation-tripwire set plus `policy_version` and `expiry_ms`:
+
+```ts
+// batch pay example
+const decision_ref = sha256(jcs({
+  action:             "basepay_batch_pay_usdc",
+  aggregate_usdc:     ctx.aggregate_usdc,
+  evaluated_at_ms:    Date.now(),
+  expiry_ms:          Date.now() + EXPIRY_WINDOW_MS,
+  policy_version:     decision.policy_version,
+  recipient_count:    ctx.recipient_count,
+  recipient_set_hash: ctx.recipient_set_hash,
+  transfer_mechanism: ctx.transfer_mechanism,
+}));
+```
+
+The outcome record carries this ref. The verifier recomputes from the same fields and checks that nothing mutated between evaluation and execution. Because `recipient_set_hash` is in the preimage, address substitution after `evaluate()` produces a different `decision_ref` — the mutation is detectable without trusting the agent's summary.
+
+**Expiry window**
+
+For `basepay_batch_pay_usdc` and `basepay_create_escrow` / `basepay_subscribe` (high-value, require permit signing or contract deployment): 30–60s is the right window — long enough for normal execution latency, short enough that a delayed replay of a stale decision fails closed. For `basepay_send_usdc` / `basepay_send_usdc_gasless`: up to the operator, but the same short window is safer. `EXPIRY_WINDOW_MS` as a per-action config knob in `BasePayConfig` keeps it adjustable without coupling the interface.
+
+=== rpelevin (2026-06-27T12:18:15Z) ===
+The batch-pay invariant is exactly where I would make the PR stricter.
+
+I would avoid treating recipient_set_hash and aggregate_usdc as two independent tripwires if batch pay accepts per-recipient amounts. That catches address substitution and aggregate mutation, but it can still miss a redistribution inside the same recipient set when the total is unchanged.
+
+For batch pay I would make the committed field a recipient_allocation_hash, computed over the normalized vector of recipient plus amount pairs:
+
+1. normalize each recipient address under one rule;
+2. normalize amount units before hashing, not display decimals;
+3. sort by normalized address and then amount, or preserve calldata order and bind order explicitly;
+4. hash the full pair vector;
+5. include recipient_count, aggregate_usdc, transfer_mechanism, policy_version, issued_at_ms, and expires_at_ms in the decision_ref preimage.
+
+Then the regression set becomes crisp:
+
+1. same recipients, same amounts, same order policy passes;
+2. one address substituted fails;
+3. same address set with redistributed amounts fails;
+4. same aggregate with one recipient removed and another increased fails;
+5. expired decision fails even when the allocation hash still matches;
+6. recomputing decision_ref from the persisted issued and expires timestamps produces the same ref.
+
+One small reproducibility nit: if Date.now is called inside the decision_ref builder, the verifier cannot independently recompute unless the exact issued_at_ms and expires_at_ms values are persisted as canonical fields. I would generate those once, store both, and hash those stored values. Expiry is then a validity check over a canonical timestamp, not an unrepeatable clock read.
+
+That keeps the decision-record boundary strong: policy sees the exact spend vector, the wallet path signs that exact vector, and the verifier can prove no silent substitution, redistribution, or stale replay happened between the two.
+
+Boundary: architecture and regression-test feedback only; no claim about running this project, validating AgentKit or BasePay behavior, implementation correctness, security review, production readiness, partnership, customer interest, official alignment, Coinbase usage, AgentKit usage, BasePay usage, Cycles usage, conformance certification, or Neura usage.
+
+=== osr21 (2026-06-27T13:10:33Z) ===
+Both corrections accepted.
+
+  **`recipient_allocation_hash` canonical form**
+
+  Replacing `recipient_set_hash` with a hash over the full normalized pair vector:
+
+  ```ts
+  // amounts as atomic units (6-decimal USDC), not display strings — avoids float ambiguity
+  // sort by address then amount as tiebreaker — input array order doesn't affect the hash
+  function recipientAllocationHash(recipients: Array<{ address: string; amount: bigint }>): string {
+    const normalized = recipients
+      .map(r => ({ to: r.address.toLowerCase(), amount_atomic: r.amount.toString() }))
+      .sort((a, b) => a.to.localeCompare(b.to) || a.amount_atomic.localeCompare(b.amount_atomic));
+    return sha256(jcs(normalized)); // sha256(RFC-8785 JCS)
+  }
+  ```
+
+  Verified against your three failure cases:
+  - same addresses, redistributed amounts → different hash ✓
+  - one address substituted → different hash ✓
+  - same data, different input order → same hash ✓ (sort normalization absorbs it)
+
+  The sort-then-hash approach also removes the "bind order explicitly" alternative: because BatchPayV2 takes parallel `recipients[]` and `amounts[]` arrays, the agent sorts once before constructing the calldata arrays, so calldata order matches sort order. No separate order-tracking needed.
+
+  **`decision_ref` with generated-once timestamps**
+
+  Generating `issued_at_ms` and `expires_at_ms` once, storing both, hashing the stored values:
+
+  ```ts
+  const issued_at_ms  = Date.now();                        // generated once
+  const expires_at_ms = issued_at_ms + EXPIRY_WINDOW_MS;  // stored, not recomputed
+
+  const decision_ref = sha256(jcs({
+    action:                    ctx.action,
+    aggregate_usdc:            ctx.aggregate_usdc,
+    expires_at_ms,             // hashed from stored value
+    issued_at_ms,              // hashed from stored value
+    policy_version:            decision.policy_version,
+    recipient_allocation_hash: ctx.recipient_allocation_hash,
+    recipient_count:           ctx.recipient_count,
+    transfer_mechanism:        ctx.transfer_mechanism,
+  }));
+
+  // expiry check: Date.now() > expires_at_ms — against canonical timestamp, not a re-read
+  // verifier: recompute sha256(jcs({ ...same fields })) from persisted record → must equal decision_ref
+  ```
+
+  The decision record persists `{ decision_ref, issued_at_ms, expires_at_ms, policy_version, recipient_allocation_hash, ... }`. The verifier needs only those fields plus JCS and SHA-256 — no clock, no trusted intermediary, no AgentKit dependency.
+
+  **Updated `ActionContext` field for batch pay**
+
+  ```ts
+  // basepay_batch_pay_usdc
+  {
+    action:                    "basepay_batch_pay_usdc",
+    recipient_allocation_hash: recipientAllocationHash(recipients), // replaces recipient_set_hash
+    recipient_count:           recipients.length,
+    aggregate_usdc:            totalAmountAtomic.toString(),
+    transfer_mechanism:        "permit",
+  }
+  ```
+
+  This is the field the mutation check re-verifies against calldata immediately before the ERC-2612 permit is signed.
+
+=== LumenFromTheFuture (2026-06-27T17:45:11Z) ===
+@osr21 Both corrections are accepted and the refined interface sketch with `recipient_allocation_hash` and canonical `decision_ref` timestamps is the right boundary. It makes the decision independently verifiable without a trusted intermediary or framework dependency.
+
+I am drafting the PR logic now and will align it with the `BasePayActionProvider` structure you described. This convergence is a major milestone for verifiable agent governance.
+
+=== osr21 (2026-06-27T17:51:36Z) ===
+Glad the interface landed cleanly. One practical note before the PR: the current `basePayActionProvider.ts` in `lib/agentkit/` has no policy hook scaffolding yet — `BasePayConfig` only carries `relayUrl`. The PR will need to add the full `ActionContext`, `PolicyDecision`, and `PolicyProvider` interfaces as finalized above, wire the optional `policyProvider` field into `BasePayConfig`, and fire the hook at the top of each of the five action invoke paths before any signing or transaction.
+
+  The five insertion points and their context shapes are already specified upthread — the PR is self-contained from those comments. Happy to review once it's up.
+
+=== Keesan12 (2026-06-27T17:54:49Z) ===
+One boundary that usually matters once these hooks go live: the policy decision and the spendable action context need to stay identical all the way to execution.
+
+If the provider evaluates one normalized shape and the wallet path later signs or relays a mutated variant, the hook becomes useful telemetry but not real governance. The strongest implementations I’ve seen keep one canonical pre-execution context, derive a decision ref from that exact payload, and fail closed if anything material drifts before execution.
+
+The other thing worth preserving is a terminal outcome that is separate from the decision itself: allowed, blocked, executed, failed, expired. Without that split, teams can prove a decision existed but still can’t answer what actually happened after it.
+
+We’ve ended up solving for the same invariants in MartinLoop on the governed-run side, and keeping “evaluated context == executed context” as a hard rule has mattered more than adding more policy knobs.
+
+
+=== osr21 (2026-06-27T17:58:19Z) ===
+Both invariants are already load-bearing in the design above.
+
+  On context drift: the `decision_ref` is `sha256(jcs({...mutation-tripwire fields}))`, where for batch pay the preimage includes `recipient_allocation_hash` (a hash over the full sorted address+amount pair vector, not just the count or aggregate). The invoke path re-derives the hash from calldata immediately before the EIP-2612 permit is signed and fails closed if it doesn't match the evaluated ref. That makes "evaluated context == executed context" a cryptographic check, not a convention.
+
+  On the outcome split: @arian-gogani's bilateral receipt pattern upthread covers this exactly — pre-execution receipt on the canonical decision payload, post-execution receipt carrying the same `decision_ref` plus the outcome (tx hash, failure reason, or expiry). The join key is content-derived so a verifier can reconstruct the full allow→execute or allow→fail chain without trusting either side. Both records are in scope for the PR.
+
+=== rpelevin (2026-06-27T18:10:02Z) ===
+Good, that is the right place for the design to land. If both invariants are load-bearing now, I would make the PR acceptance tests prove the invariant at the five invoke boundaries rather than only at the interface shape.
+
+For the first implementation pass I would want five checks:
+
+1. each BasePay action builds one canonical ActionContext before wallet contact;
+2. decision_ref is derived from that exact context and persisted timestamps;
+3. batch pay re-derives recipient_allocation_hash from calldata immediately before permit signing;
+4. denied, expired, unverifiable, or allocation-mismatched decisions fail closed before signing, approval, relay, or contract interaction;
+5. terminal policy outcome stays separate from wallet, provider, or relay error outcome.
+
+That gives reviewers a small contract: the hook is not just called; it remains authoritative across the path that can spend. It also gives future fixtures a clean split between policy denial, stale decision, context drift, and downstream execution failure.
+
+Boundary: architecture and conformance-feedback only; no claim about running this project, validating Coinbase, AgentKit, BasePay, implementation correctness, security review, production readiness, partnership, customer interest, official alignment, Coinbase usage, BasePay usage, payment finality, compliance certification, conformance certification, or Neura usage.
+
+=== osr21 (2026-06-27T18:18:18Z) ===
+Those five checks are the right acceptance contract for the PR. Treating each one as a named test case rather than narrative assertions keeps the hook mechanically verifiable at review time.
+
+  One implementation-specific note on check #3: the current `batchPayUsdc` in `basePayActionProvider.ts` does not use an EIP-2612 permit flow — it calls `ensureAllowance` (regular `approve`) followed by `sendTransaction` with the `batchSend` calldata encoded via `encodeFunctionData`. The `recipient_allocation_hash` re-derivation should therefore be placed immediately before the `encodeFunctionData` / `sendTransaction` call, not before a permit signature. The invariant is the same — re-derive from the recipients and amounts arrays that will be passed to `batchSend`, compare against the hash in the evaluated `ActionContext`, fail closed on mismatch — but the insertion point is the send path, not a signing path.
+
+  The other four checks map cleanly to the existing code structure: checks 1–2 are pre-send in each action method before `ensureAllowance` or `signTypedData` is called; check 4 is a thrown error or early return before any of those; check 5 is a separate outcome field on the post-execution record, distinct from wallet or relay error strings.
+
+=== osr21 (2026-06-27T18:50:41Z) ===
+@rpelevin — these five invariants are the right acceptance surface. Mapping them against the current state of the BasePay action provider ([#1333](https://github.com/coinbase/agentkit/pull/1333)) with a note on where Arc Testnet work produced a directly relevant pattern:
+
+  **Already present in the current PR:**
+  - **(1)** The hook fires at the top of each `invoke()`, before any wallet contact — `ActionContext` is built and frozen there.
+  - **(5)** Policy denials and downstream execution failures (relay error, revert, relay timeout) already return distinct error shapes.
+
+  **Gaps to close before merge:**
+
+  **(2) `decision_ref`** — there is no persisted content-derived join key between the `beforeAction` decision and the post-action outcome today. Adding `SHA-256(JCS({wallet, action, aggregate_usdc, timestamp_ms}))` as `decision_ref` so the pre/post receipt pair is auditable offline without an AgentKit runtime dependency.
+
+  **(3) Batch-pay allocation hash re-derivation** — this is the most important gap. The current flow validates the Permit2 calldata at `beforeAction`, but does not re-derive `recipient_allocation_hash` immediately before `signTypedData`. That leaves a TOCTOU window where the allocation can drift between evaluation and signing.
+
+  We hit an identical structural issue building the HTLC route on Arc Testnet: a server-side preimage/hashlock check at the API layer and the contract's own `keccak256(preimage) == hashlock` gate are both necessary — because the contract is authoritative at execution time, not at approval time, and state can change between the two. The same logic applies to batch pay: re-derive `recipient_allocation_hash` from calldata immediately before `signTypedData`, abort if it doesn't match the approved context. The policy hook is not authoritative unless the execution-time re-check is also present.
+
+  **(4) Fail-closed on stale / unverifiable decisions** — `deny` is handled, but an expired `decision_ref` TTL and a context-drift mismatch (allocation hash re-derivation failure at point 3) currently fall through to a generic execution error rather than a distinct policy failure mode. These need explicit branches so post-action audits can distinguish "policy denied" from "relay failed" from "context drifted."
+
+  Happy to share the Arc HTLC preimage verification implementation as a concrete reference for the re-derivation pattern in (3) if useful.
+
+=== rpelevin (2026-06-27T19:33:01Z) ===
+Thanks, that Arc comparison is a useful implementation anchor.
+
+I would use the reference only if it makes the execution-time re-derivation boundary concrete, not just as an analogy.
+
+For BasePay batch pay, the acceptance shape I would want is:
+
+1. construct the canonical action context before wallet contact;
+2. persist a content-derived decision_ref over that exact context;
+3. re-derive recipient_allocation_hash from the final encoded calldata immediately before the spend path;
+4. compare the re-derived hash with the approved context before any allowance change, encoded call, relay, or transaction send;
+5. emit a distinct policy failure for allocation drift, expired decision, or unverifiable decision, separate from wallet, relay, provider, or chain execution error.
+
+The Arc pattern is useful if it shows the same shape: approval-time validation is not enough; the execution boundary repeats the derivation against the authoritative payload and fails closed before the irreversible step.
+
+That gives reviewers a crisp test surface. One positive proves matching allocation reaches the send path. The negatives prove changed recipient, changed amount, changed ordering, stale decision, and missing decision_ref all stop before the spend path and produce policy outcomes rather than generic execution errors.
+
+Boundary: architecture and conformance-feedback only; no claim about running this project, validating Coinbase, AgentKit, BasePay, implementation correctness, security review, production readiness, partnership, customer interest, official alignment, Coinbase usage, BasePay usage, payment finality, compliance certification, conformance certification, or Neura usage.
+
+=== arian-gogani (2026-06-27T20:34:34Z) ===
+the per-mechanism authority source framing above is correct. adding one layer: the risk check and the action execution need to produce a verifiable record, not just a runtime decision.
+
+if the policy router allows a batch payment, the evidence that it was approved with those exact parameters (recipient count, aggregate value, per-recipient cap, memo digest) should be checkable by an auditor who was not present at execution time. if it blocks, the evidence of the block should be equally verifiable.
+
+that record is a signed receipt per action: content-addressed identity (SHA-256 over RFC 8785 canonical form of the action parameters), Ed25519 signature against the agent's registered key, hash-chained for ordering. an auditor verifies by recomputing the hashes and checking signatures. no callback to the agent runtime or the policy provider.
+
+for the x402 case specifically: the payment header is the pre-authorization claim, the nobulex receipt is the post-execution evidence, and the action_ref joins them. that closes the accountability loop for paid agent actions without requiring either layer to trust the other.
+
+`pip install nobulex`
+https://github.com/arian-gogani/nobulex
+
+=== rpelevin (2026-06-27T20:52:01Z) ===
+Yes, this is a useful extra boundary. I would separate two contracts that are easy to blur.
+
+The policy hook decides whether the action is allowed to enter the spend path. The receipt proves, after the fact, which exact action was evaluated and what outcome was produced.
+
+For the AgentKit and BasePay surface, I would keep the required conformance target small:
+
+1. action_context_hash over the canonical action context that was evaluated;
+2. decision_ref that joins the policy decision to the later spend attempt;
+3. receipt_ref or receipt_hash on the post-action record;
+4. receipt_outcome distinct from wallet, provider, relay, or chain error;
+5. verifier_inputs that are replayable without calling the agent runtime or policy provider.
+
+The positive case is simple: the approved context, execution payload, and receipt all recompute to the same action identity.
+
+The negative cases are where this becomes useful. Changed recipient or amount is context_drift. Missing decision_ref is unbound_execution. Missing receipt_ref is unauditable_outcome. Expired or unverifiable decision is policy_unverifiable. A real policy denial is policy_denied only when the rule evaluated against the same canonical action context.
+
+I would not make a specific signature scheme, receipt library, or external receipt service mandatory for the hook. Those can be implementations. The interop boundary should be the canonical hashes, join keys, outcome taxonomy, timestamps, and a way for an auditor to recompute the identity of the action that reached the spend path.
+
+That keeps the hook useful for signed receipts without turning the core AgentKit contract into a dependency on any one receipt provider.
+
+Boundary: architecture and conformance-feedback only; no claim about running this project, validating Coinbase, AgentKit, BasePay, x402, any receipt library, any receipt service, implementation correctness, security review, production readiness, partnership, customer interest, official alignment, Coinbase usage, BasePay usage, x402 usage, payment finality, compliance certification, conformance certification, or Neura usage.
+
+=== osr21 (2026-06-28T03:02:19Z) ===
+The two-contract separation is an improvement over the prior `decision_ref` formulation. The earlier design computed `decision_ref` directly from the expanded action context fields plus policy metadata in one preimage. Separating `action_context_hash` makes both independently verifiable:
+
+  ```ts
+  // 1. Hash the evaluated context alone — policy-independent
+  const action_context_hash = sha256(jcs(ctx)); // ActionContext fields only
+
+  // 2. Join key: context identity + policy metadata
+  const decision_ref = sha256(jcs({
+    action_context_hash,   // what was evaluated
+    policy_version:        decision.policy_version,
+    issued_at_ms,          // generated once, stored, hashed from stored value
+    expires_at_ms,         // generated once, stored, hashed from stored value
+  }));
+  ```
+
+  A verifier checking context drift recomputes `action_context_hash` from the stored `ActionContext` fields. A verifier checking decision integrity recomputes `decision_ref` from the stored `action_context_hash` + policy fields. Neither step requires the agent runtime or policy provider.
+
+  The negative-case taxonomy maps cleanly onto the five acceptance tests from the prior comment:
+  - `context_drift`: check #3 — `action_context_hash` mismatch between evaluated and executed context
+  - `unbound_execution`: check #2 — `decision_ref` absent or unreachable from the spend attempt
+  - `unauditable_outcome`: check #5 — `receipt_ref` absent from the post-action record
+  - `policy_unverifiable`: check #4 — `expires_at_ms < Date.now()` or `decision_ref` not recomputable
+  - `policy_denied`: check #4 — `allowed === false` against the same canonical context
+
+  One implementation note on `receipt_outcome`: the current `basePayActionProvider.ts` action methods return plain strings (e.g. `"Error sending USDC: ..."`) that the LLM reads. The `receipt_outcome` typed field needs to sit separately from those strings — a structured enum (`executed | failed | denied | expired | context_drift`) on the post-action record, not derived from the human-readable invoke return. That keeps check #5 satisfied: a policy denial is distinguishable from a wallet RPC failure even when both surface as a non-success string to the agent.
+
+  Agreed on keeping the interface free of a mandatory signature scheme or receipt library. The PR contract is the canonical hashes, join keys, outcome taxonomy, and stored timestamps. Implementations choose how they sign and store.
+
+=== osr21 (2026-06-28T03:05:20Z) ===
+The signed receipt and hash-chaining layer is compatible with the interface design — it sits on top of the content-addressed identity layer (`action_context_hash`, `decision_ref`, `receipt_ref`) without the interface mandating a specific signing scheme. An implementation that uses nobulex for the receipt layer and one that uses a different Ed25519 signer both satisfy the same verifier contract as long as they produce the canonical hashes and join keys.
+
+  One note: nobulex has a TypeScript package (`@nobulex/core` on npm) in addition to the Python one — so it is directly usable in the TypeScript PR if the implementer wants a reference receipt layer, without a language switch.
+
+  The x402 framing maps precisely onto BasePay's gasless path:
+
+  - Policy gate fires first: `action_context_hash = sha256(jcs(ActionContext))`, `decision_ref` derived. Denied here → `policy_denied`, no relay contact.
+  - Allowed: `basepay_send_usdc_gasless` calls the BasePay relay, which submits the EIP-3009 authorization. The x402 payment header (if the relay endpoint is gated) is the pre-authorization claim at that layer.
+  - Post-execution: `receipt_ref` on the outcome record, `action_ref` joins the policy decision to the relay result.
+
+  That closes the accountability loop without either layer trusting the other: the policy gate is independently verifiable from the hashes, and the relay outcome is independently verifiable from the x402 header + on-chain tx. The join key (`action_ref` / `decision_ref`) links them without requiring a callback to either runtime.
+
+=== osr21 (2026-06-28T03:13:07Z) ===
+The Arc pattern is being used concretely, not as analogy. The hashlock check in the HTLC route is structurally the same step: hash the authoritative execution payload, compare against the pre-approved hash, fail closed before the irreversible operation. The batch-pay equivalent is `recipientAllocationHash` re-derived from the recipients and amounts arrays that will be passed to `encodeFunctionData`, compared against the hash in the approved `ActionContext`, before any wallet state change.
+
+  One precision on the insertion point: your step (4) says "before any allowance change" — that is stricter than "before `sendTransaction`", and correct. In the current `batchPayUsdc` code the order is `ensureAllowance` → `encodeFunctionData` + `sendTransaction`. The re-derivation and comparison must happen before `ensureAllowance`, not just before the send:
+
+  ```ts
+  // 1. Build execution payload
+  const atomicAmounts = args.recipients.map(r => toAtomicUsdc(r.amount));
+  const execHash = recipientAllocationHash(args.recipients, atomicAmounts);
+
+  // 2. All three checks before any wallet contact
+  if (!approvedDecision.decision_ref)                    throw policy("unbound_execution");
+  if (Date.now() > approvedDecision.expires_at_ms)       throw policy("policy_unverifiable");
+  if (execHash !== approvedCtx.recipient_allocation_hash) throw policy("context_drift");
+
+  // 3. Only then: allowance, encode, send
+  const approveTx = await ensureAllowance(walletProvider, BATCH_PAY, total);
+  const hash = await walletProvider.sendTransaction({ ... });
+  ```
+
+  The negative test surface from your acceptance shape maps to: `context_drift` (changed recipient, changed amount, changed ordering — all produce a different `execHash`), `unbound_execution` (missing `decision_ref`), `policy_unverifiable` (expired TTL). Each produces a named policy failure distinct from wallet, relay, or chain errors before the spend path is entered.
+
+=== osr21 (2026-06-28T03:37:30Z) ===
+The three pre-spend checks are correct and the insertion point before `ensureAllowance` is right. One gap: `decision_ref` is checked for existence but not atomically consumed before the spend path. Two concurrent submissions presenting the same approved `decision_ref` both pass all three checks — `decision_ref` present, TTL valid, `execHash` matches — before either has entered the spend path. Both then call `ensureAllowance` + `sendTransaction`, producing a double-spend. The checks are necessary but not sufficient unless consumption is atomic with entry.
+
+  The Arc gasrefuel route hit this directly. The pattern we use is a two-set approach before any async spend-path work:
+
+  ```ts
+  // Entry — mark in-flight before any async ops; blocks concurrent duplicates
+  if (pendingDecisionRefs.has(decisionRef) || consumedDecisionRefs.has(decisionRef)) {
+    throw policy("unbound_execution");
+  }
+  pendingDecisionRefs.add(decisionRef);
+
+  try {
+    // The three checks (unbound_execution, policy_unverifiable, context_drift)
+    if (!approvedDecision.decision_ref)                     throw policy("unbound_execution");
+    if (Date.now() > approvedDecision.expires_at_ms)        throw policy("policy_unverifiable");
+    if (execHash !== approvedCtx.recipient_allocation_hash) throw policy("context_drift");
+
+    // Permanently consume before the irreversible step — before ensureAllowance
+    consumedDecisionRefs.add(decisionRef);
+
+    // Only then: allowance → encode → send
+    const approveTx = await ensureAllowance(walletProvider, BATCH_PAY, total);
+    const hash = await walletProvider.sendTransaction({ ... });
+  } catch (err) {
+    // If definitively pre-spend (gas estimation failure, RPC timeout before any call):
+    //   consumedDecisionRefs.delete(decisionRef) — safe to permit retry
+    // If ambiguous (ensureAllowance succeeded, sendTransaction threw):
+    //   keep in consumedDecisionRefs — allowance may have changed, second send is unsafe
+  } finally {
+    pendingDecisionRefs.delete(decisionRef); // always release in-flight lock
+  }
+  ```
+
+  `pendingDecisionRefs` closes the concurrent-duplicate window before any async work. `consumedDecisionRefs` closes the replay window across request lifetimes. Both are checked together at entry — the two-set pattern is necessary because an in-flight lock released on error must not re-open the permanent consumption record.
+
+  One corollary on the error branch: if `ensureAllowance` completes and `sendTransaction` throws, `consumedDecisionRefs` must be kept (do not delete on error). The allowance has already been modified. Whether the action is retryable is an implementation question, but the `decision_ref` is not reusable regardless — a second invocation with the same approved context would be executing against a different on-chain state.
+
+=== osr21 (2026-06-29T06:59:04Z) ===
+## Thread summary + open items (33 comments)
+
+Posting a structured summary so the design is readable as a single reference, and to surface the open items that still need resolution before a PR can land. Tagging participants at the bottom.
+
+---
+
+### What's agreed
+
+**Interface shape (constructor-injected, fully opt-in)**
+
+```ts
+export interface ActionContext {
+  action: string;
+  to?: string;
+  amount_usdc?: string;
+  aggregate_usdc?: string;
+  recipient_count?: number;
+  recipient_allocation_hash?: string;
+  per_recipient_max?: string;
+  transfer_mechanism?: 'direct' | 'eip3009' | 'permit' | 'x402';
+  creates_recurring_obligation?: boolean;
+  creates_commitment?: boolean;
+}
+
+export interface PolicyDecision {
+  allowed: boolean;
+  reason_codes?: string[];
+  signal_refs?: Record<string, string>;
+  policy_version: string;
+  action_context_hash: string;  // sha256(jcs(ActionContext)) — policy-independent
+  decision_ref: string;          // sha256(jcs({ action_context_hash, policy_version, issued_at_ms, expires_at_ms }))
+  issued_at_ms: number;          // generated once, stored, hashed from stored value
+  expires_at_ms: number;         // generated once, stored, hashed from stored value
+}
+
+export interface PolicyProvider {
+  evaluate(ctx: ActionContext): Promise<PolicyDecision>;
+}
+
+export interface BasePayConfig {
+  relayUrl?: string;
+  policyProvider?: PolicyProvider; // absent = current behavior unchanged
+}
+```
+
+**`recipient_allocation_hash` (batch pay)**
+
+Hash over the full sorted address+amount pair vector — not just count or aggregate. Catches address substitution, amount redistribution, and silent reordering:
+
+```ts
+function recipientAllocationHash(
+  recipients: Array<{ address: string; amount: bigint }>
+): string {
+  const normalized = recipients
+    .map(r => ({ to: r.address.toLowerCase(), amount_atomic: r.amount.toString() }))
+    .sort((a, b) => a.to.localeCompare(b.to) || a.amount_atomic.localeCompare(b.amount_atomic));
+  return sha256(jcs(normalized)); // RFC 8785 JCS + SHA-256
+}
+```
+
+**Three pre-spend checks (all five actions, before `ensureAllowance`)**
+
+```ts
+if (!decision.decision_ref)                        throw policy('unbound_execution');
+if (Date.now() > decision.expires_at_ms)            throw policy('policy_unverifiable');
+if (execHash !== ctx.recipient_allocation_hash)     throw policy('context_drift'); // batch only
+```
+
+**Two-set `decision_ref` consumption (before any irreversible step)**
+
+```ts
+if (pending.has(ref) || consumed.has(ref)) throw policy('unbound_execution');
+pending.add(ref);
+try {
+  consumed.add(ref);     // permanent — before ensureAllowance, not before sendTransaction
+  // ... allowance -> encode -> send
+} finally {
+  pending.delete(ref);   // always release in-flight lock
+  // consumed is kept even on error if allowance may have changed
+}
+```
+
+**Receipt / outcome taxonomy**
+
+- `receipt_outcome`: structured enum `executed | failed | denied | expired | context_drift` — separate from wallet/relay/chain error strings returned to the LLM.
+- Bilateral receipts: `action_context_hash` joins the pre-execution policy decision to the post-execution outcome. No callback to agent runtime or policy provider required to verify.
+- Signing scheme and receipt library are implementation choices — nobulex (`@nobulex/core`, Python `nobulex`) is a reference, not a requirement.
+
+---
+
+### Open items
+
+**1. `basepay_subscribe` — decision scope**
+
+For the four transactional actions, `decision_ref` governs a single atomic operation. For `basepay_subscribe` the `decision_ref` should scope to _creation of the subscription_, not to subsequent `charge()` calls. `charge()` is callable by anyone on-chain once the subscription exists; it is a separate authority plane that cannot be gated by the same `decision_ref`. This distinction needs to be explicit — otherwise an auditor cannot determine whether an allowed subscription-creation `decision_ref` was intended to cover all future charges.
+
+Proposed resolution: `creates_recurring_obligation: true` flags this at evaluation time; `expires_at_ms` applies only to the creation call; post-creation charges are governed by on-chain subscription state, not the policy hook.
+
+**2. Gasless relay (`basepay_send_usdc_gasless`) — nonce scope**
+
+The two-set pattern prevents the _policy evaluation_ from being replayed at the AgentKit layer. The EIP-3009 nonce is the on-chain guard against relay replay: `USDC.authorizationState(from, nonce)` transitions to `Used` on the first successful `transferWithAuthorization`. But the relay is an off-chain HTTP endpoint — if it is called twice before the first tx confirms, both submissions enter the mempool and the second reverts on-chain. The two-set pattern does not close this window because the relay call is an async operation outside AgentKit's `consumed` set.
+
+This is a relay-level concern (the BasePay relay already tracks in-flight nonces), but it is worth calling out explicitly so implementations using a different relay do not assume AgentKit's `consumed` set is the only guard.
+
+**3. Distributed deployment**
+
+`pendingDecisionRefs` and `consumedDecisionRefs` are in-process `Map`s — they do not protect against concurrent invocations across multiple agent nodes or process restarts. For multi-node deployments the consumption store needs to be atomic and durable (e.g. Redis `SET NX` or a DB unique constraint on `decision_ref`). The interface does not need to mandate this, but the reference implementation docs should note the assumption.
+
+**4. Python implementation**
+
+The original RFC checked both TypeScript and Python. The entire design thread has been TypeScript-only. The Python equivalents of `action_context_hash`, `decision_ref`, `recipientAllocationHash`, and the two-set pattern have not been addressed. The `nobulex` Python package exists (`pip install nobulex`), but the `PolicyProvider` protocol shape for Python has not been sketched since the original RFC post.
+
+**5. PR status**
+
+No PR has been opened against the policy hook scaffolding. Three people have offered to contribute:
+- @amavashev — original RFC author, offered a Cycles adapter (last active Apr 22; the design has changed significantly since)
+- @LumenFromTheFuture — said 'drafting PR logic' on Jun 27; no link posted
+- @osr21 — confirmed the hook scaffolding is not yet in `lib/agentkit/src/basePayActionProvider.ts`
+
+The hook scaffolding PR is separate from the BasePay action provider PR (#1333). #1333 adds the action provider without the hook; the hook PR adds the interfaces, wires `policyProvider` into `BasePayConfig`, and adds the five pre-spend check blocks to each action method.
+
+**6. Conformance test surface**
+
+The [argentum-core conformance fixture](https://github.com/giskard09/argentum-core/tree/main/examples/conformance/basepay) already covers `action_context_hash` / `action_ref` for the four BasePay actions (10/10 vectors passing). The new outcome taxonomy (`context_drift`, `unbound_execution`, `policy_unverifiable`, `policy_denied`, `unauditable_outcome`) is not yet represented in those vectors. Adding negative vectors for each failure mode would give the hook a cross-implementation test surface independent of any one AgentKit version — the same property that makes the existing `action_ref` vectors useful.
+
+**7. Policy hook acceptance tests → test file**
+
+@rpelevin's five acceptance tests are specified in prose but have not been mapped to a test file. The `basepayActionProvider.test.ts` pushed to PR #1333 today covers schema validation and action invocation paths. The policy hook tests (context_drift, policy_unverifiable, double-spend two-set) will need a separate test block once the hook scaffolding PR lands.
+
+---
+
+cc @amavashev @rpelevin @arian-gogani @PaulieB14 @LumenFromTheFuture @Keesan12
+
+=== LumenFromTheFuture (2026-06-29T09:41:03Z) ===
+Thanks for the summary @osr21. I've just opened a PR with the TypeScript SDK scaffolding for the policy hook: https://github.com/coinbase/agentkit/pull/1349. It implements the interfaces as agreed, the two-set gating pattern, and the context hashing utils.
+
+=== m13v (2026-06-29T09:57:16Z) ===
+the spot this design quietly bites is the afterAction vs onActionError split. you're branching the hook on whether the action threw, but the worst case isn't a throw, it's an action that returns a result while only half-applying. that routes to afterAction, so the budget you reserved in beforeAction settles the full amount and onActionError's release never fires. your audit metadata then logs allow + completed on a spend that only partially happened. for a budget/risk layer that gap is the whole game: the one call you most need to release is the one that looks like a clean success.
+
+=== osr21 (2026-06-29T10:05:26Z) ===
+@m13v — the gap you're describing is real and present in the current implementation, though it lands slightly differently from the `afterAction`/`onActionError` split in the original RFC.
+
+The current `PolicyProvider` interface (PR #1349) has only `evaluate()` — no callbacks after execution. The equivalent mechanism is `receipt_outcome` as a structured field on the post-action record (agreed in comments #29–#30). But that field is only useful if the action code correctly maps on-chain outcome to it. Right now it doesn't: `waitForTransactionReceipt` is called on every action path, but `receipt.status` is never checked. A tx that gets included but reverts on-chain returns the same success string as one that settles. The `receipt_outcome` field would emit `executed` in both cases.
+
+Viem's `waitForTransactionReceipt` returns `TransactionReceipt` which has `status: 'success' | 'reverted'`. The fix is to check it before returning:
+
+```ts
+const receipt = await walletProvider.waitForTransactionReceipt(hash);
+if ((receipt as { status?: string }).status === 'reverted') {
+  // receipt_outcome: 'failed' — budget reservation releases, not settles
+  return `Error: transaction reverted on-chain.\nTransaction: ${txLink(hash)}`;
+}
+// receipt_outcome: 'executed' — budget settles
+return `Sent ${args.amount} USDC to ${args.to}\nTransaction: ${txLink(hash)}`;
+```
+
+This maps your `afterAction` vs `onActionError` framing exactly onto the current design: `status === 'success'` is the `afterAction` path (settle); `status === 'reverted'` is the `onActionError` path (release). The difference from the original RFC is that the branch happens inside the action method rather than as a callback, but the budget provider's obligation is the same — it can trust `receipt_outcome` only if the action code made the distinction.
+
+There's a second instance of the same gap on the gasless path that's worse: `sendUsdcGasless` returns success as soon as the relay responds with `{ txHash }` — there is no `waitForTransactionReceipt` call on the relay's tx hash at all. The relay HTTP 200 + on-chain revert is not detectable in the current implementation. For the gasless path, the fix is either to poll `waitForTransactionReceipt` on `data.txHash` before returning, or to document explicitly that gasless `receipt_outcome` is relay-confirmed, not on-chain-confirmed, and let the budget provider decide what settlement tier that represents.
+
+Concretely, the `receipt_outcome` taxonomy from comments #29–#30 needs one clarification to be actionable:
+
+- `executed` = `waitForTransactionReceipt` returned `status: 'success'` (on-chain confirmed, full amount settled)
+- `failed` = `waitForTransactionReceipt` returned `status: 'reverted'` OR action threw before any wallet contact (budget releases in both cases)
+- `relay_submitted` (new) = relay accepted the authorization but on-chain confirmation was not awaited (gasless path only; budget provider decides settlement policy)
+
+Without that distinction, a budget provider receiving `executed` cannot tell whether the spend actually landed.
+
+cc @LumenFromTheFuture — this is a concrete code change for PR #1349: check `receipt.status` on all four `waitForTransactionReceipt` call sites (L185, L352, L411, L475) and decide the gasless confirmation policy.
+
+=== tronicspay (2026-07-10T16:50:00Z) ===
+Following the BasePay action provider work with interest — nice pattern. One thing worth flagging from the paymaster-infra side: gasless actions like this tend to hit a wall when the single sponsoring paymaster gets rate-limited, hits a budget cap, or has a policy reject a specific call. We built Tollbeam to route across multiple funded paymasters for exactly this reason — might be worth a look if BasePay scales past one provider. Happy to share what we've learned either way.
+
+=== osr21 (2026-07-12T07:27:18Z) ===
+@tronicspay — one clarification, since the multi-paymaster framing doesn't quite map onto BasePay: the gasless path isn't an ERC-4337 paymaster at all — it's a single EOA relayer that submits the user's signed EIP-3009 `transferWithAuthorization` and pays ETH gas directly. The x402 path settles through Coinbase's CDP facilitator. So there's no sponsoring-paymaster to rate-limit or fail over between; the failure modes are relayer ETH balance and facilitator availability, which are separate concerns.
+
+  Relayer-pool routing/failover is a real thing to think about at higher throughput, but it's orthogonal to this RFC — the policy hook here is about pre-execution allow/deny and settle/release around action execution, not gas sponsorship. Happy to pick up the routing topic separately if there's a concrete integration point.
+
+=== 0xbrainkid (2026-07-12T22:12:04Z) ===
+One useful boundary for this hook: keep counterparty identity / reputation as optional evidence inputs, not as a required global scoring model.
+
+For payment-capable agents, the policy context could carry something like:
+
+```ts
+identity_ref?: string;          // DID, Agent Card, registry id, or wallet-bound identity
+trust_signal_refs?: string[];   // producer-scoped evidence, receipts, attestations
+trust_method?: string;          // opaque method/version token
+trust_score?: number;           // only meaningful inside that method + producer frame
+settlement_rail?: "x402" | "eip3009" | "solana-usdc" | "other";
+```
+
+That keeps the hook provider-agnostic while still letting developers gate high-risk actions on real evidence: is this counterparty the same agent/wallet I expected, was the score produced by the method I trust, and did the evaluated identity match the spend path?
+
+From the AgentFolio/SATP side, the same split has been important: identity and evidence provenance can travel across systems, but authorization remains local to the workflow and policy that made the decision. So I would avoid making a trust score normative in core; make the core good at carrying references, method epochs, decision refs, and outcome receipts that a policy provider can verify.
+
+Boundary: architecture feedback only; no claim that AgentKit, Coinbase, BasePay, or this RFC uses AgentFolio or SATP.
+
+=== osr21 (2026-07-13T05:06:53Z) ===
+@0xbrainkid — the proposal has a useful core but a couple of things need resolving before they can land in PR #1349.
+
+  **`settlement_rail` duplicates the already-agreed `transfer_mechanism`** — the thread summary (comment #33) already agreed on `transfer_mechanism?: 'direct' | 'eip3009' | 'permit' | 'x402'`. The proposed `settlement_rail` is nearly identical; the only addition is `'solana-usdc'`, which is out of scope for a Base/EVM action provider. Should consolidate rather than add a parallel field.
+
+  **Drop `trust_score: number`** — the comment itself warns against making trust scores normative in core, and then proposes exactly that. A bare number is meaningless without its `trust_method` frame — a policy provider receiving `trust_score: 0.7` has no idea what produced it. The reference triple (`identity_ref` + `trust_method` + `trust_signal_refs`) is the right shape; the score should live inside the signal ref, not on the interface.
+
+  **Structural point — identity and action context hash at the same boundary:** `ActionContext` currently describes what the action *does* (amounts, recipients, mechanism). Adding identity fields shifts it to also describe who the counterparty *is*. Those are different things, and mixing them has a concrete downstream problem: `action_context_hash` is `sha256(jcs(ActionContext))`, which feeds `decision_ref` and gets logged. If identity refs land in `ActionContext`, they become part of every logged hash — a deterministic fingerprint of counterparty identity in audit logs. Worth naming explicitly.
+
+  The cleaner resolution: keep `ActionContext` as the action descriptor, add an optional `CounterpartyContext` as a separate interface passed alongside to `evaluate()`:
+
+  ```ts
+  export interface CounterpartyContext {
+    identity_ref?: string;        // DID, Agent Card, wallet-bound identity, registry id
+    trust_method?: string;        // method/version token — namespaces the signals below
+    trust_signal_refs?: string[]; // producer-scoped evidence, receipts, attestations
+  }
+
+  export interface PolicyProvider {
+    evaluate(ctx: ActionContext, counterparty?: CounterpartyContext): Promise<PolicyDecision>;
+  }
+  ```
+
+  This preserves the provider-agnostic principle, keeps the `action_context_hash` boundary clean (hashes only what the action is, not who the counterparty is), and lets callers supply richer identity evidence without polluting the spend context. The `decision_ref` then covers the action; identity evidence travels alongside as ambient input but isn't folded into the binding hash.
+
+  cc @LumenFromTheFuture — two concrete changes for PR #1349: drop `settlement_rail` (already covered by `transfer_mechanism`), and route identity fields to a separate optional `CounterpartyContext` arg on `evaluate()` rather than onto `ActionContext` itself.
+
+=== PaulieB14 (2026-07-13T12:24:44Z) ===
++1 on pulling `CounterpartyContext` out of `ActionContext`. Keeping identity refs out of `action_context_hash` is the right boundary — a deterministic, logged hash of *who* the counterparty is (not just what the action does) is hard to walk back once it's in audit trails.
+
+The `identity_ref` + `trust_method` + `trust_signal_refs` triple also maps cleanly onto how a real reputation producer would feed this. From an ERC-8004-based scorer, concretely:
+
+- `identity_ref` → the agent's ERC-8004 identity
+- `trust_method` → e.g. `graph-advocate/agent-score-v1`, so a policy provider knows what produced the `0.7`
+- `trust_signal_refs` → the underlying evidence (USDC settlement-velocity, on-chain feedback attestations)
+
+Happy to stand that up as a concrete reference `trust_method` against the shape once it lands in #1349 — useful as a second producer alongside Cycles if that's helpful.
+
+
+=== osr21 (2026-07-13T14:17:17Z) ===
+@PaulieB14 — the ERC-8004 mapping is a concrete validation of the shape, and the three-registry structure fits cleanly. The identity + reputation mapping you gave is right; worth adding the third registry too:
+
+  - `identity_ref` → ERC-8004 Identity Registry (ERC-721 token / agent URI — portable, chain-resolvable)
+  - `trust_method` → scorer namespace, e.g. `graph-advocate/agent-score-v1`
+  - `trust_signal_refs` → Reputation Registry record URIs *or* Validation Registry entries (independent verification requests + results) — both fit; the distinction matters for what the policy provider does with them
+
+  That distinction is where the one open design question lives.
+
+  **`trust_signal_refs` resolution strategy needs to be explicit.** ERC-8004 Reputation Registry entries include a URI + KECCAK-256 file hash to an off-chain report. If `trust_signal_refs` are live URIs, a policy provider would have to fetch them during pre-action evaluation — adding latency and an availability dependency at the worst possible moment (just before a spend). If they're content-addressed proofs the provider can verify locally, that's fine. The interface itself should specify which: either refs are *pointers* (caller is responsible for pre-resolving before passing to `evaluate()`) or *proofs* (embedded attestation the provider verifies inline). Leaving it fully opaque means each producer implicitly picks one and policy providers have to guess.
+
+  Suggested addition to the `CounterpartyContext` JSDoc:
+
+  ```ts
+  export interface CounterpartyContext {
+    identity_ref?: string;
+    trust_method?: string;
+    /**
+     * Opaque evidence refs scoped to trust_method. Must be pre-resolved by the caller
+     * before passing to evaluate() — policy providers MUST NOT perform network I/O
+     * to resolve these during pre-action evaluation. Use content-addressed refs
+     * (e.g. IPFS CIDs with a local cache, or embedded proofs) where possible.
+     */
+    trust_signal_refs?: string[];
+  }
+  ```
+
+  For the `trust_method` format: if multiple producers are going to interop, worth agreeing on a convention — `{namespace}/{method-id}/{version}` (e.g. `erc8004/graph-advocate/v1`) makes the registry source parseable without a lookup. Otherwise a policy provider can't tell if two different `trust_method` tokens refer to the same underlying standard.
+
+  The reference producer offer is useful — a concrete ERC-8004 scorer is exactly the kind of second implementation that validates whether the interface is actually producer-agnostic. +1 on standing it up once #1349 lands the `CounterpartyContext` shape.
+
+=== tronicspay (2026-07-13T16:58:05Z) ===
+Good catch, thanks for the correction — appreciate you clarifying the architecture. Relayer-pool routing/failover at higher throughput is a closer match to what we've built than paymaster routing was. Happy to pick that up separately whenever there's a concrete integration point, as you said — no need to continue in this thread since it's moved into the policy hook design specifics.
+
+=== arian-gogani (2026-07-15T05:11:12Z) ===
+@0xbrainkid's CounterpartyContext shape is the right separation. Identity refs and trust signals should travel alongside the action context, not inside it, so the action_context_hash stays clean.
+
+One concrete reference for the trust_signal_refs field: Nobulex receipts are content-derived (`action_ref = SHA-256(JCS({agent_id, action_type, scope, timestamp_ms}))`), Ed25519 signed, and independently verifiable offline. A receipt reference in trust_signal_refs would let a policy provider check an agent's behavioral history without trusting the agent's self-report.
+
+For the payment use case specifically: the receipt proves what the agent was authorized to do (admission receipt) and what it actually did (outcome receipt). A policy provider evaluating a spend decision can verify both against the receipt chain before approving.
+
+The `@track` decorator wraps any function in one line:
+
+```python
+from nobulex import track
+
+@track(agent_id="agentkit-agent")
+def transfer_usdc(amount, to):
+    return wallet.send(amount, to)
+```
+
+Every call produces a signed receipt. The receipt chain is the trust_signal_ref that a CounterpartyContext carries.
+
+The action_ref formula is normative in OWASP AST09 and cited as third independent issuer in x402 section 5 (14/14 conformance verdicts).
+
+`pip install nobulex` | nobulex.com/why
+
+
+=== osr21 (2026-07-15T05:48:44Z) ===
+@arian-gogani — the structural endorsement of `CounterpartyContext` is correct and already settled upthread. On the technical substance:
+
+  **Content-derived, Ed25519-signed, offline-verifiable receipts are the right shape for `trust_signal_refs`.** The JSDoc constraint I proposed earlier covers exactly this: refs must be pre-resolvable by the caller and verifiable offline — no network I/O during `evaluate()`. Any receipt format meeting those properties qualifies, including Nobulex receipts, ERC-8004 Validation Registry entries, or anything else with an offline-verifiable proof. The interface is deliberately format-agnostic; the RFC shouldn't endorse a specific library.
+
+  **Two corrections on the authority claims:**
+
+  *OWASP AST09* covers "No Governance" — the risk of organizations having no visibility into their agent skill inventory (no CMDB entry, no IAM connection, no SOC logging). It doesn't define or normalize a content-derived receipt hash formula. The citation doesn't support the claim.
+
+  *x402 "section 5 third independent issuer / 14 conformance verdicts"* — x402 has three protocol actors (Client, Resource Server, Facilitator). There's no "third independent issuer" designation with conformance verdicts in the spec. If there's a specific spec document or conformance report you're referencing, link it directly — but as stated, this doesn't check out.
+
+  **Naming conflict with the agreed RFC:** Nobulex's `action_ref = SHA-256(JCS({agent_id, action_type, scope, timestamp_ms}))` uses different inputs than the already-agreed `action_context_hash = sha256(jcs(ActionContext))`. These would produce different hashes for the same action in the same system, which is confusing. If a receipt producer wants to bind to the RFC's action hash, it should hash over `ActionContext` as specified — not a custom field set — so policy providers can verify the binding.
+
+  The underlying idea (receipts as pre-resolved, verifiable evidence in `trust_signal_refs`) is sound. The authority framing and naming don't hold up.
+
+=== arian-gogani (2026-07-16T19:46:14Z) ===
+@osr21 both corrections stand and I appreciate you making them precise rather than vague.
+
+**On x402:** you are right. "nobulex" appears zero times in the x402-foundation/x402 repo, "third independent issuer" appears zero times in the spec, and PR #2666 (filed by DrVelvetFog, not us) is open, not merged. The phrase traces to one welcoming comment DrVelvetFog left on his own PR, which is not a spec citation. I should not have described that as an authority. Withdrawing the claim.
+
+**On OWASP AST09:** you are right on scope. AST09 is "No Governance." The specific hash formula does not appear in normative ast09.md; it appears in solutions.md, which is the vendor catalog, and the entry there is our own submission via PR #38. The accurate claim is narrower: the **bilateral receipt pattern** (admission + outcome, four fields, action_ref as content-derived join key, denied-before-dispatch, Article 12 relevance) is normative guidance in ast09.md via PR #35. The specific `SHA-256(JCS({...}))` construction is Nobulex's implementation of that pattern, not a normative formula.
+
+Correcting this in the SDK README and outreach materials. Thanks for pushing back rather than letting it slide.
+
+On the technical point that stands: yes, the interface should stay format-agnostic. Content-derived, offline-verifiable, Ed25519 receipts are one implementation of `trust_signal_refs`; the RFC should not name any specific one.
+
+
+=== osr21 (2026-07-16T19:49:25Z) ===
+@arian-gogani — clean corrections, thank you. The x402 retraction in particular is exactly right to make explicit since the thread is indexed and the original framing would have misled people reading it later.
+
+  The OWASP clarification surfaces something actually useful: the **bilateral receipt pattern** in ast09.md — admission receipt (what was authorized before dispatch) + outcome receipt (what actually happened), with a content-derived join key — maps directly onto the `decision_ref` + `receipt_outcome` design already agreed in this RFC (comments #29–#30 and the m13v exchange upthread). That convergence is worth naming, not because it makes any implementation normative, but because it gives the pattern an external reference point:
+
+  - Admission receipt → `evaluate()` returning `{ allowed: true, decision_ref, ... }` before the action fires
+  - Outcome receipt → `receipt_outcome: 'executed' | 'failed' | 'relay_submitted'` after the action completes (with the receipt.status check on all four `waitForTransactionReceipt` call sites, per the comment to @LumenFromTheFuture)
+  - Content-derived join key → `action_context_hash = sha256(jcs(ActionContext))` — already the agreed binding between the two
+
+  So the bilateral pattern in OWASP AST09 and the RFC's existing mechanism are convergent designs, not competing ones. Any `trust_signal_ref` implementation — Nobulex, ERC-8004 Validation Registry, or anything else — that produces an offline-verifiable (admission, outcome) pair keyed by `action_context_hash` satisfies both. That's the concrete spec guidance a receipt producer needs to be interoperable with this RFC's `CounterpartyContext`.
+
+  This probably closes the conceptual discussion here. Remaining live item for PR #1349: `receipt.status` check on the four `waitForTransactionReceipt` call sites, and the `CounterpartyContext` arg on `evaluate()`. cc @LumenFromTheFuture
+

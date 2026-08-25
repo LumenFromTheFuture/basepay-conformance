@@ -1,0 +1,12 @@
+--- a/typescript/agentkit/src/policy/utils.ts
++++ b/typescript/agentkit/src/policy/utils.ts
+@@ -13,7 +13,8 @@
+ 
+ /**
+  * recipientAllocationHash: RFC 8785 JCS hash over sorted address+amount pairs.
+- * Catches address substitution, amount redistribution, and silent reordering.
++ * Order-insensitive (permutation is intentionally invisible); catches address
++ * substitution, amount changes, and redistribution.
+  */
+ export async function recipientAllocationHash(
+   recipients: Array<{ address: string; amount: bigint }>,

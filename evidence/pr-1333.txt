@@ -1,0 +1,69 @@
+title: feat: add BasePay action provider — gasless USDC, batch pay, escrow, subscriptions on Base Mainnet
+state: open merged: False
+user: osr21
+head: feat/basepay-action-provider @ 56dbbeaa115e070af4e94f4b0c3e870d9fd102fe
+base: main
+
+body:
+## Summary
+
+  This PR adds **BasePay** as a community action provider for AgentKit, giving AI agents five USDC payment primitives on **Base Mainnet** with no additional dependencies.
+
+  ### Actions added
+
+  | Action | Description |
+  |--------|-------------|
+  | `basepay_send_usdc` | Direct USDC transfer (agent pays ETH gas) |
+  | `basepay_send_usdc_gasless` | EIP-3009 relay — **no ETH needed by the agent** |
+  | `basepay_batch_pay_usdc` | Pay up to 200 recipients atomically |
+  | `basepay_create_escrow` | Time-lock USDC for a beneficiary |
+  | `basepay_subscribe` | On-chain recurring USDC payment |
+
+  ### How gasless works
+
+  The agent signs an EIP-3009 `TransferWithAuthorization` typed message (no on-chain tx). The [BasePay relay](https://base-pay.replit.app) submits it to `USDC.transferWithAuthorization()`, paying the ETH gas. This means agents can send USDC with **zero ETH balance** — a critical unlock for autonomous agent wallets.
+
+  ### Verified contracts (Base Mainnet)
+
+  | Contract | Address |
+  |----------|---------|
+  | BatchPayV2 | [`0xe40d…c68`](https://basescan.org/address/0xe40d2292c050566d16cecda74627b70778806c68#code) |
+  | EscrowV2 | [`0x1eb2…499`](https://basescan.org/address/0x1eb2b1e8dda64fc4ccb0537574f2a2ca9f307499#code) |
+  | SubscriptionManagerV2 | [`0x1019…421`](https://basescan.org/address/0x101918a252b3852ac4b50b7bbf2525d3084d5421#code) |
+
+  ### Usage
+
+  ```typescript
+  import { AgentKit } from "@coinbase/agentkit";
+  import { basePayActionProvider } from "./action-providers/basepay";
+
+  const agentKit = await AgentKit.from({
+    walletProvider,
+    actionProviders: [basePayActionProvider()],
+  });
+  ```
+
+  Or via the standalone npm package:
+
+  ```bash
+  npm install basepay-agentkit @coinbase/agentkit viem zod
+  ```
+
+  ```typescript
+  import { basePayActionProvider } from "basepay-agentkit";
+  ```
+
+  ### Self-hosting the relay
+
+  The relay is open-source ([github.com/osr21/basepay](https://github.com/osr21/basepay)) and requires only a funded EOA (ETH on Base) to operate. Configurable via `basePayActionProvider({ relayUrl: "https://your-relay.example.com" })`.
+
+  ### No new dependencies
+
+  The provider uses only packages already in the AgentKit dependency graph (`viem`, `zod`). The relay call uses native `fetch`.
+
+  ---
+
+  **Live dApp**: https://base-pay.replit.app  
+  **npm package**: https://www.npmjs.com/package/basepay-agentkit  
+  **Contracts + source**: https://github.com/osr21/basepay
+  

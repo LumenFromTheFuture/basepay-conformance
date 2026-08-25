@@ -1,0 +1,97 @@
+{
+  "regression": "resolve-contract (osr21 #1141 spec)",
+  "provider_root": "../src-patched",
+  "summary": {
+    "total": 12,
+    "passed": 12,
+    "failed": 0,
+    "rejected_invoke": 0
+  },
+  "cases": [
+    {
+      "id": "RC-G1",
+      "name": "basepay_send_usdc_gasless: policy_denied -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-G2",
+      "name": "basepay_send_usdc_gasless: policy_unverifiable -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-G3",
+      "name": "basepay_send_usdc_gasless: context_drift -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-G4",
+      "name": "basepay_send_usdc_gasless: unbound_execution -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-G5",
+      "name": "gasless replay: second use of same decision_ref resolves to duplicate denial (no reject, no second sign)",
+      "pass": true,
+      "detail": "first relay_confirmed; second resolved to duplicate denial; 1 signature total",
+      "rejected": false
+    },
+    {
+      "id": "RC-D1",
+      "name": "basepay_send_usdc: policy_denied -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-D2",
+      "name": "basepay_send_usdc: policy_unverifiable -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-B1",
+      "name": "basepay_batch_pay_usdc: policy_denied -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-B2",
+      "name": "basepay_batch_pay_usdc: policy_unverifiable -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-E1",
+      "name": "basepay_create_escrow: policy_denied -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-S1",
+      "name": "basepay_subscribe: policy_denied -> resolves to classified string (no reject), wallet untouched",
+      "pass": true,
+      "detail": "resolved; wallet untouched",
+      "rejected": false
+    },
+    {
+      "id": "RC-P1",
+      "name": "pending release: denied call leaves no in-flight ref; next fresh call executes",
+      "pass": true,
+      "detail": "deny recorded, then fresh ref executed",
+      "rejected": false
+    }
+  ],
+  "generated_at": "2026-08-24T22:21:42.014Z"
+}

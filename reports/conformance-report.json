@@ -1,0 +1,243 @@
+{
+  "fixture": "basepay-conformance",
+  "target": {
+    "repo": "LumenFromTheFuture/agentkit (coinbase/agentkit PR #1349)",
+    "head_sha": "8380c34b9769cc255ff50d78b4ad2bafdd3de354",
+    "acceptance_shape": "issue #1141, maintainer-agreed three pre-spend checks + two-set consumption"
+  },
+  "environment": {
+    "node": "v24.19.0",
+    "platform": "linux"
+  },
+  "summary": {
+    "total": 19,
+    "passed": 19,
+    "failed": 0
+  },
+  "cases": [
+    {
+      "id": "P0",
+      "name": "baseline: no policy provider, behavior unchanged",
+      "pass": true,
+      "detail": "transfer executed; calldata decodes to exactly (ALICE, 10.5 USDC atomic)",
+      "evidence": {
+        "out": "Sent 10.5 USDC to 0x1111111111111111111111111111111111111111 [executed]\nTransaction: https://basescan.org/tx/0xababababababababababababababababababababababababa",
+        "decoded": "0x1111111111111111111111111111111111111111,10500000"
+      }
+    },
+    {
+      "id": "F1",
+      "name": "allow: executes, receipt outcome=executed, executed allocation == evaluated allocation",
+      "pass": true,
+      "detail": "1 send; calldata == (ALICE, 100 USDC)",
+      "evidence": {
+        "receipt": "executed",
+        "evaluated": {
+          "action": "basepay_send_usdc",
+          "to": "0x1111111111111111111111111111111111111111",
+          "amount_usdc": "100",
+          "transfer_mechanism": "direct"
+        }
+      }
+    },
+    {
+      "id": "F2",
+      "name": "deny: policy_denied before read/sign/send",
+      "pass": true,
+      "detail": "wallet untouched (0 reads, 0 sends, 0 signs)",
+      "evidence": {
+        "walletCalls": [],
+        "receipt": "denied"
+      }
+    },
+    {
+      "id": "F3",
+      "name": "unbound_execution: missing decision_ref fails before wallet contact",
+      "pass": true,
+      "detail": "wallet untouched; receipt=unauditable_outcome",
+      "evidence": {
+        "receipt": "unauditable_outcome"
+      }
+    },
+    {
+      "id": "F4",
+      "name": "policy_unverifiable: expired TTL fails before wallet contact",
+      "pass": true,
+      "detail": "wallet untouched; receipt=expired",
+      "evidence": {
+        "receipt": "expired"
+      }
+    },
+    {
+      "id": "F5",
+      "name": "context_drift: decision for (BOB,5) cannot execute (ALICE,100)",
+      "pass": true,
+      "detail": "wallet untouched; receipt=context_drift",
+      "evidence": {
+        "forgedHash": "8406cb17060f15b7",
+        "receipt": "context_drift"
+      }
+    },
+    {
+      "id": "F6",
+      "name": "batch allow: executed (recipients,amounts) == evaluated; hash join holds",
+      "pass": true,
+      "detail": "calldata recipients/amounts match evaluated allocation; recomputed exec hash == evaluated hash",
+      "evidence": {
+        "executedRecipients": [
+          "0x1111111111111111111111111111111111111111",
+          "0x2222222222222222222222222222222222222222"
+        ],
+        "executedAmounts": [
+          "10000000",
+          "20000000"
+        ],
+        "execHash": "9fc0feaf168c0247",
+        "evaluatedHash": "9fc0feaf168c0247"
+      }
+    },
+    {
+      "id": "F7",
+      "name": "batch context_drift: approved [[\"0x2222\",\"10\"]] != executed [[\"0x1111\",\"10\"]]",
+      "pass": true,
+      "detail": "context_drift before ensureAllowance: 0 allowance reads, 0 sends",
+      "evidence": {
+        "walletCalls": [],
+        "receipt": "context_drift"
+      }
+    },
+    {
+      "id": "F8",
+      "name": "batch context_drift: approved [[\"0x1111\",\"20\"]] != executed [[\"0x1111\",\"10\"]]",
+      "pass": true,
+      "detail": "context_drift before ensureAllowance: 0 allowance reads, 0 sends",
+      "evidence": {
+        "walletCalls": [],
+        "receipt": "context_drift"
+      }
+    },
+    {
+      "id": "F9",
+      "name": "batch context_drift: approved [[\"0x1111\",\"10\"],[\"0x2222\",\"20\"]] != executed [[\"0x1111\",\"20\"],[\"0x2222\",\"10\"]]",
+      "pass": true,
+      "detail": "context_drift before ensureAllowance: 0 allowance reads, 0 sends",
+      "evidence": {
+        "walletCalls": [],
+        "receipt": "context_drift"
+      }
+    },
+    {
+      "id": "F10",
+      "name": "sequential replay: second use of same decision_ref denied; exactly one spend",
+      "pass": true,
+      "detail": "1 send total; receipts=executed,denied",
+      "evidence": {
+        "receipts": [
+          "executed",
+          "denied"
+        ],
+        "sends": 1
+      }
+    },
+    {
+      "id": "F11",
+      "name": "concurrent duplicates: pending-set blocks second submission; exactly one spend",
+      "pass": true,
+      "detail": "1 send; receipts=denied,executed",
+      "evidence": {
+        "receipts": [
+          "denied",
+          "executed"
+        ],
+        "sends": 1
+      }
+    },
+    {
+      "id": "F12",
+      "name": "gasless allow: signed EIP-3009 message == evaluated (ALICE, 5 USDC); relay_confirmed",
+      "pass": true,
+      "detail": "signTypedData message matches evaluated allocation; 1 relay call; receipt=relay_confirmed",
+      "evidence": {
+        "msg": {
+          "to": "0x1111111111111111111111111111111111111111",
+          "from": "0xaaaaaaaabbbbbbbbccccccccddddddddeeeeeeee",
+          "value": "5000000"
+        },
+        "relayBody": "{\"from\":\"0xaaaaaaaabbbbbbbbccccccccddddddddeeeeeeee\",\"to\":\"0x1111111111111111111111111111111111111111\",\"value\":\"5000000\"",
+        "receipt": "relay_confirmed"
+      }
+    },
+    {
+      "id": "F13",
+      "name": "gasless deny: policy_denied before signature and relay",
+      "pass": true,
+      "detail": "no signature produced, no relay call, receipt=denied",
+      "evidence": {
+        "receipt": "denied",
+        "relayCalls": 0,
+        "rejected": false
+      }
+    },
+    {
+      "id": "F14",
+      "name": "gasless replay: decision_ref consumed before signing; no second signature",
+      "pass": true,
+      "detail": "1 signature, 1 relay call; second submission denied",
+      "evidence": {
+        "signatures": 1,
+        "relayCalls": 1,
+        "secondRejected": false
+      }
+    },
+    {
+      "id": "F15",
+      "name": "revert classification: on-chain revert → [failed], not [executed]",
+      "pass": true,
+      "detail": "receipt_outcome=failed",
+      "evidence": {
+        "receipt": "failed",
+        "out": "Error: transaction reverted on-chain. [failed]\nTransaction: https://basescan.org/tx/0xababababababababababababababababab"
+      }
+    },
+    {
+      "id": "F16",
+      "name": "hash properties: deterministic, order-canonical, amount/address-sensitive, JCS key-order-independent",
+      "pass": true,
+      "detail": "all six properties hold",
+      "evidence": {
+        "deterministic": true,
+        "orderCanonical": true,
+        "amountSensitive": true,
+        "addressSensitive": true,
+        "jcsKeyOrderIndependent": true
+      }
+    },
+    {
+      "id": "F16b",
+      "name": "recomputable join: action_context_hash and decision_ref re-derived from stored fields alone",
+      "pass": true,
+      "detail": "both keys recompute from the receipt fields",
+      "evidence": {
+        "action_context_hash": "2d56dac4011ad9a7",
+        "decision_ref": "58230b43dc3a2c95"
+      }
+    },
+    {
+      "id": "F17",
+      "name": "escrow/subscribe carry creates_commitment / creates_recurring_obligation risk signals",
+      "pass": true,
+      "detail": "both signals present on evaluated ctx; both actions executed",
+      "evidence": {
+        "escrowCtx": {
+          "creates_commitment": true,
+          "action": "basepay_create_escrow"
+        },
+        "subCtx": {
+          "creates_recurring_obligation": true,
+          "action": "basepay_subscribe"
+        }
+      }
+    }
+  ],
+  "generated_at": "2026-08-24T22:21:42.681Z"
+}

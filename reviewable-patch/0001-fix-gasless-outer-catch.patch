@@ -1,0 +1,20 @@
+--- a/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.ts
++++ b/typescript/agentkit/src/action-providers/basepay/basepayActionProvider.ts
+@@ -441,6 +441,17 @@
+         });
+         return `Error calling BasePay relay: ${e instanceof Error ? e.message : String(e)}`;
+       }
++    } catch (e: unknown) {
++      // Fix FINDING-1: match the other four actions' outer catch. Pre-spend
++      // policy failures (deny / expired TTL / context drift / duplicate
++      // decision_ref) must RESOLVE to a classified failure string, not reject
++      // the invoke() promise. recordPolicyOutcome(null, ...) is a no-op, so
++      // outcomes already recorded inside checkPolicy are not double-recorded.
++      const message = e instanceof Error ? e.message : String(e);
++      await this.recordPolicyOutcome(decision, this.classifyPolicyError(e), {
++        error: message,
++      });
++      return `Error sending gasless USDC: ${message}`;
+     } finally {
+       if (ref) this.pending.delete(ref);
+     }

@@ -1,0 +1,41 @@
+title: feat: policy hook scaffolding for BasePayActionProvider
+state: open merged: False
+user: LumenFromTheFuture
+head: feat/basepay-action-provider @ 8380c34b9769cc255ff50d78b4ad2bafdd3de354
+base: main
+
+body:
+# feat: policy hook scaffolding for BasePayActionProvider
+
+This PR adds the opt-in policy hook scaffolding to the `BasePayActionProvider` as discussed in RFC #1141.
+
+## Changes
+
+- Adds `typescript/agentkit/src/policy/` directory with:
+  - `interfaces.ts`: `ActionContext`, `PolicyDecision`, and `PolicyProvider` definitions.
+  - `utils.ts`: `actionContextHash` and `recipientAllocationHash` (RFC 8785 JCS + SHA-256).
+- Updates `BasePayActionProvider`:
+  - Adds `policyProvider` to `BasePayConfig`.
+  - Implements the **two-set pattern** (`pending` and `consumed` Sets) for atomic gating of `decision_ref`.
+  - Adds pre-spend check blocks to all five actions (`sendUsdc`, `sendUsdcGasless`, `batchPayUsdc`, `createEscrow`, `subscribe`).
+  - Correctly implements the `recipient_allocation_hash` check for `batchPayUsdc`.
+  - Handles the `creates_recurring_obligation` and `creates_commitment` flags.
+
+## Why this is needed
+
+The policy hook allows external providers (like budget managers or risk evaluators) to gate AgentKit actions before they hit the wallet or relay. The two-set pattern ensures that a `decision_ref` cannot be re-used within the same process, providing a baseline guard against double-invocation.
+
+## Taxonomy
+
+This PR implements the following failure modes in the hook:
+- `policy_denied`
+- `unbound_execution`
+- `policy_unverifiable`
+- `context_drift`
+
+## Status
+
+Draft logic is complete. Ready for review against the agreed interfaces in #1141.
+
+cc @osr21 @amavashev @rpelevin @arian-gogani
+
