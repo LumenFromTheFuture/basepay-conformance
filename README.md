@@ -54,11 +54,12 @@ promise instead of returning a structured failure string. See `FINDINGS.md`.
 FINDING-1 is fixed on the PR: the outer-catch repair shipped in commit
 `15bdc2e` (2026-08-25), and the maintainer has since reviewed each follow-up
 head at the diff level — `15bdc2e`, `1c2330e` (authority-bound decision
-consumption), `1d16d0a` (precise single-attempt contract wording) — with
+consumption), `1d16d0a` (precise single-attempt contract wording),
+`9d28b41` (review-history labels removed from production comments) — with
 native verification green (`tsc` clean, full Jest 966/966, basepay 69/69).
-The maintainer confirmed FINDING-1 at the diff level and stated the PR is
-mergeable; the outstanding gate is the Heimdall maintainer-side review. The
-PR head is `1d16d0a` (this fixture's runner still pins the verbatim
-`8380c34` head it was built against; the harness is a supplementary,
-offline-rerunnable conformance asset, while native Jest is the canonical
-gate).
+The maintainer confirmed FINDING-1 at the diff level, confirmed both follow-ups
+correct, and stated the PR is mergeable; the outstanding gate is the Heimdall
+maintainer-side review. The PR head is `9d28b41` (this fixture's runner still
+pins the verbatim `8380c34` head it was built against; the harness is a
+supplementary, offline-rerunnable conformance asset, while native Jest is the
+canonical gate).
